@@ -528,8 +528,9 @@ All measurements, the method behind them and their evaluation are in [RESULTS.md
   queue (6 runs) and 108 up; none of the 17 v59 runs had a stall (v57: 4 of 7).
 - **One RBM33G box, two LTE links, IPsec:** the box's MIPS CPU is the limit: one TCP flow 38–41 Mbit/s through the
   tunnel and 45–48 through the transparent proxy, while the same SIMs with a BPI-R4 as the brain gave 68–102 Mbit/s.
-  On this box the bond buys reliability, not speed: it is slower than the best single link alone when that link is
-  good.
+  Through the proxy the box beat its best single link by 22–73 % while that link alone was below the box's CPU
+  ceiling (~70–80 Mbit/s without IPsec, ~60–70 with); through the tunnel it stays below a strong single link and buys
+  reliability, not speed.
 - **Reliability tests** T1–T16 on the box (restarts, address changes, lost keys, zombie modem, throttled SIM, rekey,
   power cut, overnight run) passed, some after fixes (hardware caveat: inserting a SIM while running resets the box).
 - **Final v65 on the box (27 Nov):** the tunnel survived a modem cut during a live UDP stream in every mode; a link

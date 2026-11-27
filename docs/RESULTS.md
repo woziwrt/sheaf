@@ -31,11 +31,12 @@ packages 65-r1. Earlier versions are named where a number was measured with them
 | lab, throttled 256 kbit/s SIM beside a 25 Mbit/s link (v59 → v60) | 10.7 → 18.6 Mbit/s over 60 s, **22.4** after the demotion (the good link alone: 21.9) |
 | BPI-R4 hub, 4 LTE links, IPsec, one TCP flow through the tunnel (v59) | down **158–188 Mbit/s** with the 1–2 MB flow queue (6 runs; 59–77 with 256 KB), up **108**; runs with a stall: v59 **0 of 17**, v57 4 of 7 |
 | single RBM33G box, 2 LTE links, IPsec, one TCP flow | tunnel 17–23 → **38–41 Mbit/s** after flowtable, `-tungro`, `-auth=half`; transparent proxy **45–48** |
+| single RBM33G box vs its best link alone, measured at the same time | proxy **+22 to +73 %** while the best link alone was below the box's CPU ceiling (~70–80 Mbit/s without IPsec, ~60–70 with); −7 to −16 % when it was above; the tunnel stayed below a strong single link |
 | same SIMs, BPI-R4 as the brain, RBM33G only carrying the modems | **73, 74, 82 Mbit/s** = **82–92 %** of the raw links used together (89); 68–102 over all measured runs |
 | reliability tests on the box (T1, T2, T4–T6, T8–T11, T15, T16) | **all passed**, T5 and T16 after fixes; T10 passed with a hardware caveat (inserting a SIM while running resets the box) |
 | overnight soak, 9.5 h, v64 | no restart, sheaf RSS flat at **13 MB**, idle data **~15 MB per day per SIM** |
 | power on → working tunnel | **75 s** (firmware image), ~95 s after a power cut |
-| final v65 on the box (27 Nov) | sheaf killed → both links back in 8 s; tunnel 31.9–36.5 Mbit/s, proxy 47.2–48.0 (v64 the evening before: 38–41 / 45–48); a modem cut during a live UDP stream survived in every mode; a one-direction link failure is not detected per direction |
+| final v65 on the box (27 Nov) | sheaf killed → both links back in 8 s; hourly rounds 08:31–17:01: tunnel **31–41 Mbit/s**, transparent proxy **46–48** all day; a modem cut during a live UDP stream survived in every mode; a one-direction link failure is not detected per direction |
 
 ## Conclusions
 
@@ -45,10 +46,12 @@ packages 65-r1. Earlier versions are named where a number was measured with them
    the better link alone (79), within the run-to-run spread. Repair, per-flow order, pacing in
    the scheduler and the 1 MB flow queue together removed the multi-second stalls seen with v57, in the lab and on LTE.
 
-2. **Hardware verdict: the RBM33G (MT7621, 880 MHz MIPS) is too weak for the bonding software at LTE speeds.** Its CPU
-   time per packet is the limit, not the radio, the links, IPsec or the algorithm. After every optimisation that was
-   cheap to make (flowtable, HalfSipHash, GSO writes into the TUN) one TCP flow gets 38–41 Mbit/s through the tunnel
-   and 45–48 Mbit/s through the transparent proxy. Proof: with the same SIMs at the same time, the BPI-R4 (Cortex-A73)
+2. **Hardware verdict: the RBM33G (MT7621, 880 MHz MIPS) is too weak for the tunnel at LTE speeds; its proxy adds the
+   links up only below a CPU ceiling.** Its CPU time per packet is the limit, not the radio, the links, IPsec or the
+   algorithm. After every optimisation that was cheap to make (flowtable, HalfSipHash, GSO writes into the TUN) one TCP
+   flow gets 38–41 Mbit/s through the tunnel and 45–48 Mbit/s through the transparent proxy (59–69 through the direct
+   proxy with IPsec, about 80 without). Through the proxy the box did beat its best single link by 22–73 % whenever
+   that link alone was below the ceiling (point 3). Proof: with the same SIMs at the same time, the BPI-R4 (Cortex-A73)
    as the brain gave 73–82 Mbit/s (steady 95 in the best run) where the raw links together gave 89, and the R4
    throttled with cgroup `cpu.max` to 12.5 % of one core fell to 24 Mbit/s, the RBM33G's level before the box-side
    optimisations (17–23). Per packet the MT7621 needs ~720 µs, one
@@ -60,14 +63,20 @@ packages 65-r1. Earlier versions are named where a number was measured with them
 
    | setup | bonded | best single link | verdict |
    |---|---|---|---|
-   | RBM33G alone, 26 Nov (same minutes) | tunnel 18.5–20.3, proxy 59–69 (v59, before the CPU work) | Vodafone raw 70.9 | slower than the best link |
-   | RBM33G alone, final (v64) | tunnel 38–41, proxy 45–48 | Vodafone raw 79 (19:48 the same evening, from the R4 through the satellite) | slower than the best link |
+   | RBM33G alone, **proxy**, best link below the CPU ceiling (24 Nov night, v32 / v37, without IPsec) | up 66.1; down 49.7 / 81.7 | Vodafone raw 38.2 up, 40.9 / 60.5 down (same minutes) | **+73 % up, +22 % / +35 % down** (98 % of the raw sum up, 84 % down) |
+   | RBM33G alone, **proxy**, 26 Nov 15:20 (v59, IPsec) | 59–69 | Vodafone alone through sheaf (backup mode), same block: 43.9 | **+34 to +57 %** |
+   | RBM33G alone, **proxy**, best link above the ceiling (24 Nov night, v34 and the build after it; 26 Nov 13:40, v59, IPsec) | 61.3 / 68.0; 65.9 | Vodafone raw 73.3 / 76.2; 70.9 | −16 / −11 %; −7 % |
    | RBM33G alone, 24 Nov round 5 | ~79 without IPsec, ~61 with IPsec (proxy) | Vodafone raw 107.4 | slower than the best link |
+   | RBM33G alone, **tunnel**, 26 Nov (same minutes) | 18.5–20.3 (v59, before the CPU work) | Vodafone raw 70.9 | slower than the best link |
+   | RBM33G alone, **tunnel**, final (v64) | 38–41 (proxy 45–48) | Vodafone raw 79 (19:48 the same evening, from the R4 through the satellite) | slower than the best link |
    | BPI-R4 as the brain, same two SIMs, 26 Nov 19:48–19:52 | 73, 74, 82 (steady 95 in the best run) | Vodafone raw 79, O2 raw 27; both raw together 89 | **82–92 % of the raw sum**; −8 to +4 % against the best link, within the run-to-run spread (steady +20 % in the best run) |
    | BPI-R4 hub, 4 links, v59, 26 Nov morning | 158–188 (6 runs with the 1–2 MB flow queue; the four 1 MB default runs: median 167) | backup mode on Vodafone only, **through sheaf (not raw)**: 100–104 | **+52–88 %** over that link (medians +64 %); no raw single link was measured that morning |
 
-   On the RBM33G the bond buys **reliability, not speed**: a modem that loses its address, its signal or its IPsec SA
-   is invisible to the LAN (T2: ping through the tunnel 300/300 while O2 changed its address). The raw sum of the four
+   On the RBM33G the **proxy adds the links up** (+22 to +73 % over the best single link in these runs) as long as
+   that link alone is below the box's CPU ceiling of ~70–80 Mbit/s without IPsec (~60–70 with); above it the bond is
+   slower than that link. The **tunnel** (all IP traffic) is CPU-bound below a strong single link and buys
+   **reliability, not speed**: a modem that loses its address, its signal or its IPsec SA is invisible to the LAN (T2:
+   ping through the tunnel 300/300 while O2 changed its address). The raw sum of the four
    hub links used together (156 down / 121 up) was measured the evening before the v59 runs, at a different time of
    day, so the v59 result is not stated as a share of it.
 
@@ -220,8 +229,9 @@ first measured on 26 November and turned out much slower on this box ([below](#s
 | what | result |
 |---|---|
 | plain sum O2 + Vodafone (night) | up 67.2, down 71.6 Mbit/s |
-| sheaf v32 (night, no IPsec) | up **66.1 (98 %)**, down 49.7 (69 %) |
-| sheaf v37, `GOMAXPROCS=2`, a LAN client downloads 100 MB (night, no IPsec) | **81.7 Mbit/s = 84 %** of a plain sum of 97.6 |
+| Vodafone alone, plain (night, same minutes) | up 38.2, down 40.9 Mbit/s |
+| sheaf v32 (night, no IPsec) | up **66.1 (98 %)**, down 49.7 (69 %): +73 % / +22 % over Vodafone alone |
+| sheaf v37, `GOMAXPROCS=2`, a LAN client downloads 100 MB (night, no IPsec) | **81.7 Mbit/s = 84 %** of a plain sum of 97.6 (Vodafone 60.5: +35 %) |
 | long transfer through the running service, IPsec | 3.1 GB in 430 s = **58.5 Mbit/s**, per minute 55–62, no stall |
 | box boot to working tunnel (firmware image) | 75 s |
 | ping through the tunnel, small web page | ~45 ms, 210–240 ms |
@@ -328,7 +338,7 @@ the tunnel unless stated, 15–30 s.
 | tunnel, v57 / v59, ABBA, 30 s | 18.9, 20.3 / 20.2, 18.5 Mbit/s; v59 changed nothing here |
 | raw links in the same minutes, 10 s | O2 53.5 + Vodafone 70.9 = ~124 Mbit/s (the tunnel got 16 % of it) |
 | proxy, then tunnel | 65.9 / 20.3; proxy 59–69 in other runs |
-| backup mode, Vodafone only | tunnel 19.6, proxy 43.9 |
+| backup mode, Vodafone only | tunnel 19.6, proxy 43.9 (both links in the same block: tunnel 20.0, proxy 59–69) |
 | without IPsec (frame 1400) | tunnel 22.9, proxy 74.9 |
 | from the box itself through the tunnel (no LAN, no NAT) | 20.4 |
 | box `-maxq` 100 / 40 / 20 | 18.3 / 17.8 / ~19 |
@@ -435,7 +445,8 @@ missing modem no longer swaps them); removing the mode file returns the default 
 the box's sheaf ports only under IPsec, set without interrupting the tunnel.
 
 **Not run:** T3 (modem re-enumerated on USB; covered only by a lab test of the supervisor with fake interfaces), T7
-(natural end of a data allowance), T12 (memory during a long repair hole; covered by `GOMEMLIMIT` and the soak's flat
+(natural end of a data allowance: not done by decision; the prepaid O2 SIM does not throttle when its allowance is used
+up, it stops passing data altogether, which for sheaf is an ordinary dead link, covered by T2, T4 and T11), T12 (memory during a long repair hole; covered by `GOMEMLIMIT` and the soak's flat
 RSS), T13 (CPU and MTU counters under bidirectional load), and from T14 only the v57/v59 A/B (not the `-maxq` 20/40
 comparison).
 
@@ -465,9 +476,26 @@ every 500 ms and feedback every 20 ms (estimated 100+ MB per day; ~12 kB/s measu
 Box 1 (RBM33G, O2 + Vodafone, IPsec) with sheaf v65, packages 65-r1.
 
 - **T1 on v65:** the sheaf core killed with `kill -9`: both links back after 8 s, ping through the tunnel without loss.
-- **Daytime (08:31), one TCP flow down, 15 s, three rounds:** tunnel 36.5 / 31.9 / 34.5 Mbit/s (steady 41.1 / 35.7 /
-  36.2), transparent proxy 47.6 / 47.2 / 48.0: about the level of v64 (tunnel 38–41, proxy 45–48 the evening
-  before, a different time of day); v65 changes no behaviour.
+- **Day profile, one round every hour from 08:31 to 17:01** (stopped after 17:01 when O2's data allowance ran out), one
+  TCP flow down to a computer behind the box. Tunnel, 15 s: computer → box → `shf0` → `tcpbench` on the server.
+  Transparent proxy, 20 s: computer → box → transparent proxy → server → a 1 GB file on a public speed-test server
+  (`curl`); the server alone downloads from that internet server at ~730 Mbit/s, so the path behind the server was not
+  the limit. Mbit/s (steady rate of the tunnel in brackets):
+
+  | round | 08:31 (3×) | 09:01 | 10:01 | 11:01 | 12:01 | 13:01 | 14:01 | 15:01 | 16:01 | 17:01 |
+  |---|---|---|---|---|---|---|---|---|---|---|
+  | tunnel | 36.5 / 31.9 / 34.5 (41 / 36 / 36) | 35.7 (39) | 30.9 (35) | 37.3 (41) | 40.5 (44) | 39.1 (44) | 38.7 (42) | 39.1 (44) | 38.5 (43) | 38.9 (43) |
+  | proxy | 47.6 / 47.2 / 48.0 | 48.0 | 46.0 | 48.0 | 48.0 | 47.6 | 48.2 | 48.2 | 48.1 | 47.8 |
+
+  The tunnel gave 31–37 in the morning and a steady 38–41 from noon (the level of v64); the proxy stayed flat at
+  46–48 all day, independent of the links and of the time of day. In every round both links were alive, none was
+  marked slow, link srtt 41–66 ms, both IPsec SAs up, sheaf RSS 17.8–21.1 MB without a trend.
+- **CPU in the 16:01 round** (`top` every 5 s): tunnel at 38.5 Mbit/s with 20–26 % idle, softirq 23–27 %, sheaf
+  51–55 %; proxy at 48.1 Mbit/s with 23–42 % idle, softirq 22–28 %, sheaf 37–48 %. That is about as little idle CPU
+  as v37 had at 82 Mbit/s through the direct proxy without IPsec, i.e. roughly **1.6× the CPU per Mbit/s**. It is not
+  a regression of v65: the transparent proxy to the internet gave ~48 from its first measurement on 26 November
+  (48.3 / 47.7 / 48.0) and with every `-auth` setting (46.8 / 47.2 / 48.1), while the direct proxy to the server gave
+  59–69 with IPsec. The share of the transparent redirection and of IPsec in that cost was not separated.
 - **Modes, a UDP stream of 8 Mbit/s for 30 s down to the box** (`udpstream`):
 
   | test | loss | late p99 | late max |

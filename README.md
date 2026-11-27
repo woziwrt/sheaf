@@ -34,7 +34,7 @@ hardware. All results, the method and the evaluation are in **[docs/RESULTS.md](
 |---|---|
 | BPI-R4 hub, four LTE links, through the tunnel | **158–188 Mbit/s** down with the 1–2 MB flow queue (6 runs), **108** up; no stall in any of 17 v59 runs (v57: 4 of 7) |
 | same two SIMs as the single box, BPI-R4 as the brain | 73, 74 and 82 Mbit/s = **82–92 %** of the two raw links used together (89); the best run about equal to the best link alone (79) |
-| single RBM33G box, two LTE links | tunnel **38–41 Mbit/s**, transparent TCP proxy **45–48 Mbit/s** |
+| single RBM33G box, two LTE links | tunnel **38–41 Mbit/s**, transparent TCP proxy **45–48 Mbit/s**; through the proxy **+22 to +73 %** over the best link alone while that link was below the box's CPU ceiling |
 | lab, emulated links, vs an ideal single link with the summed rate | 95 % static and varying, 89 % "drive" |
 | reliability tests on the box (restarts, address changes, lost keys, zombie modem, throttled SIM, rekey, power cut, overnight run) | all passed, some after fixes (hardware caveat: inserting a SIM while running resets the box) |
 
@@ -43,10 +43,12 @@ hardware. All results, the method and the evaluation are in **[docs/RESULTS.md](
 - **The concept works on a fast enough CPU.** On the BPI-R4 the bond carries one TCP flow at 82–92 % of the sum of
   two links used together and, with four links, at 158–188 Mbit/s (the best link alone, in backup mode through sheaf:
   100–104).
-- **The RBM33G is too weak for the bonding software at LTE speeds.** Its CPU time per packet is the limit (~720 µs
-  against ~70 µs on one Cortex-A73 core): even after flowtable, HalfSipHash and GSO writes into the TUN device, a
-  single box is slower than its best modem alone when that modem has a good signal. On the RBM33G the bond buys
-  reliability (a modem failure is invisible to the LAN), not speed. For practical use choose an ARM64 or x86 class box
+- **The RBM33G is too weak for the tunnel at LTE speeds.** Its CPU time per packet is the limit (~720 µs against
+  ~70 µs on one Cortex-A73 core). Through the transparent TCP proxy, which costs far less CPU per byte, the box beat
+  its best single link by 22–73 % whenever that link alone was below the box's CPU ceiling (~70–80 Mbit/s without
+  IPsec, ~60–70 with); a stronger single link was faster than the bond. Through the tunnel (all IP traffic) the box
+  stays below a strong single link even after flowtable, HalfSipHash and GSO writes into the TUN device; there the
+  bond buys reliability (a modem failure is invisible to the LAN), not speed. For practical use choose an ARM64 or x86 class box
   such as the BPI-R4; the RBM33G remains fine as a satellite that only carries modems, or where reliability matters
   more than speed.
 
