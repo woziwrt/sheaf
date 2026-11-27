@@ -1,0 +1,182 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Petr Wozniak
+# Switch an RBM33G between its two roles, both directions, with one command:
+#   sheaf-role                 show the role, the LAN address and the DHCP server
+#   sheaf-role box             a box of its own: LAN 192.168.1.1/24, DHCP server on, sheaf + IPsec to the server
+#   sheaf-role satellite N     satellite N of the hub: LAN 10.77.N.1N/24, DHCP off, only the modems, the hub's links
+#                               10.77.N.(99+2N) and 10.77.N.(100+2N) leave through them (masqueraded)
+#   sheaf-role -n box|satellite N   (or DRYRUN=1) only print what would change
+# What it changes (nothing else; the box lines of sheaf.conf - BOX, ID1/2, PORT1/2, TUN, TUNGW, SRV, IPSEC, APN, EXTRA,
+# ... - are kept):
+#   /etc/sheaf/sheaf.conf   the ROLE / SAT_SRC1 / SAT_SRC2 lines (box: removed = the default role; satellite: one line)
+#   network.lan               ipaddr, netmask
+#   dhcp.lan.ignore           satellite: 1; box: removed (DHCP server on)
+#   firewall.lte, firewall.lan_lte   zone + forwarding of a satellite (sheaf-run adds them in that role); box: removed,
+#                             else the LAN could be forwarded straight to the modems, outside the tunnel
+#   firewall.sheaf, firewall.lan_sheaf, dnsmasq resolvers   box: put back as 90-sheaf sets them, only if missing
+#   ip rules "from SAT_SRCx"  box: removed (runtime only, sheaf-run adds them in the satellite role)
+# Safe to run again: only what differs is changed; nothing to change = nothing restarted. Before a change, the four
+# config files are copied to /etc/sheaf/role-backup/<time>/ (the 5 newest are kept; /etc/sheaf/ survives sysupgrade).
+# The change is applied detached at the end (sheaf stopped, network + firewall + dnsmasq reloaded, sheaf started):
+# the box drops off its old address, the SSH session with it. Log of that part: /tmp/sheaf-role.log.
+# ROOT=<dir> (tests only): work on <dir>/etc/... with "uci -c", print the detached part instead of running it.
+# shellcheck disable=SC3043 # busybox ash has local
+R=${ROOT:-}
+CONF=$R/etc/sheaf/sheaf.conf
+BACKUPS=$R/etc/sheaf/role-backup
+DRYRUN=${DRYRUN:-0}
+[ "$1" = -n ] && { DRYRUN=1; shift; }
+
+u() { uci ${R:+-c "$R/etc/config"} "$@"; }
+get() { u -q get "$1"; }
+die() { echo "sheaf-role: $*" >&2; exit 1; }
+# the role lines as sheaf-run sees them: source the file in a subshell (it is shell, sheaf-run sources it too)
+# shellcheck disable=SC1090
+conf_vals() { ( ROLE=box; SAT_SRC1=; SAT_SRC2=; [ -f "$CONF" ] && . "$CONF" >/dev/null 2>&1; echo "${ROLE:-box}:$SAT_SRC1:$SAT_SRC2" ); }
+read_role() { IFS=: read -r CR C1 C2 <<E
+$(conf_vals)
+E
+}
+
+show() {
+	local dhcp=on
+	read_role
+	[ "$(get dhcp.lan.ignore)" = 1 ] && dhcp=off
+	case $CR in
+	satellite) echo "role: satellite (hub's links from ${C1:-?} and ${C2:-?})" ;;
+	*) echo "role: $CR${C1:+ (SAT_SRC1=$C1)}${C2:+ (SAT_SRC2=$C2)}" ;;
+	esac
+	echo "LAN: $(get network.lan.ipaddr)/$(get network.lan.netmask), DHCP server $dhcp"
+	get firewall.lte >/dev/null && echo "firewall: zone lte (satellite masquerade on the modems) present"
+	pgrep -f "^/bin/sh /usr/sbin/sheaf-run" >/dev/null 2>&1 && echo "service: sheaf-run running" || echo "service: sheaf-run not running"
+}
+
+[ $# = 0 ] && { show; exit 0; }
+
+case "$1" in
+box) [ $# = 1 ] || die "usage: sheaf-role box"
+	WANT=box; IP=192.168.1.1; S1=; S2= ;;
+satellite)
+	N=$2
+	case "$N" in [1-9]) ;; *) die "usage: sheaf-role satellite N (N = 1..9; the BPI-R4 hub has ports for 1 and 2)" ;; esac
+	[ $# = 2 ] || die "usage: sheaf-role satellite N"
+	WANT=satellite; IP=10.77.$N.1$N; S1=10.77.$N.$((99 + 2 * N)); S2=10.77.$N.$((100 + 2 * N)) ;;
+*) die "usage: sheaf-role [-n] [box | satellite N]" ;;
+esac
+
+[ -f "$CONF" ] || die "$CONF missing (is the sheaf package installed?)"
+read_role; OLDROLE=$CR; OLD1=$C1; OLD2=$C2
+[ "$OLDROLE" = hub ] && die "this board is a hub (ROLE=hub in $CONF): sheaf-role switches only box <-> satellite"
+# never commit somebody's half-done uci edit together with ours
+for p in network dhcp firewall; do
+	[ -z "$(u changes $p 2>/dev/null)" ] || die "uncommitted uci changes in $p (uci changes $p): commit or revert them first"
+done
+
+# --- the plan: compare, note what differs; APPLY=1 makes the same pass change it ------------------------------------
+CHANGED= # uci packages changed
+NPLAN=0
+note() { NPLAN=$((NPLAN + 1)); echo "  - $*"; }
+mark() { case " $CHANGED " in *" $1 "*) ;; *) CHANGED="$CHANGED $1" ;; esac; }
+setv() { # key value
+	local have; have=$(get "$1")
+	[ "$have" = "$2" ] && return 0
+	note "$1: ${have:-(unset)} -> $2"; mark "${1%%.*}"
+	[ "$APPLY" = 1 ] && u set "$1=$2"
+	return 0
+}
+delv() { # key (option or section)
+	get "$1" >/dev/null || return 0
+	note "$1: remove${2:+ ($2)}"; mark "${1%%.*}"
+	[ "$APPLY" = 1 ] && u delete "$1"
+	return 0
+}
+# the box role's own firewall zone and resolvers, exactly as firmware/90-sheaf sets them (only when missing)
+box_base() {
+	if ! get firewall.sheaf >/dev/null; then
+		note "firewall.sheaf: add zone sheaf on shf0 (masquerade, MSS clamp), as 90-sheaf"; mark firewall
+		[ "$APPLY" = 1 ] && { u set firewall.sheaf=zone; u set firewall.sheaf.name=sheaf; u add_list firewall.sheaf.device=shf0
+			u set firewall.sheaf.input=REJECT; u set firewall.sheaf.output=ACCEPT; u set firewall.sheaf.forward=REJECT
+			u set firewall.sheaf.masq=1; u set firewall.sheaf.mtu_fix=1; }
+	fi
+	if ! get firewall.lan_sheaf >/dev/null; then
+		note "firewall.lan_sheaf: add forwarding lan -> sheaf, as 90-sheaf"; mark firewall
+		[ "$APPLY" = 1 ] && { u set firewall.lan_sheaf=forwarding; u set firewall.lan_sheaf.src=lan; u set firewall.lan_sheaf.dest=sheaf; }
+	fi
+	if [ "$(get 'dhcp.@dnsmasq[0].noresolv')" != 1 ]; then
+		note "dnsmasq: resolvers 1.1.1.1 + 9.9.9.9 through the tunnel, noresolv, as 90-sheaf"; mark dhcp
+		[ "$APPLY" = 1 ] && { u -q delete 'dhcp.@dnsmasq[0].server'; u add_list 'dhcp.@dnsmasq[0].server=1.1.1.1'
+			u add_list 'dhcp.@dnsmasq[0].server=9.9.9.9'; u set 'dhcp.@dnsmasq[0].noresolv=1'; }
+	fi
+}
+CONFLINE="ROLE=satellite; SAT_SRC1=$S1; SAT_SRC2=$S2   # satellite $N of the hub (sheaf-role)"
+conf_step() {
+	if [ "$WANT" = box ]; then
+		[ "$OLDROLE" = box ] && [ -z "$OLD1$OLD2" ] && return 0
+		note "$CONF: remove the ROLE / SAT_SRC1 / SAT_SRC2 lines (now $OLDROLE${OLD1:+ $OLD1 $OLD2}; default = box)"
+		[ "$APPLY" = 1 ] && sed -i '/^ROLE=/d; /^SAT_SRC[12]=/d' "$CONF"
+	else
+		[ "$OLDROLE $OLD1 $OLD2" = "satellite $S1 $S2" ] && return 0
+		note "$CONF: role $OLDROLE${OLD1:+ $OLD1 $OLD2} -> satellite $S1 $S2"
+		[ "$APPLY" = 1 ] && { sed -i '/^ROLE=/d; /^SAT_SRC[12]=/d' "$CONF"; echo "$CONFLINE" >> "$CONF"; }
+	fi
+}
+plan() {
+	conf_step
+	setv network.lan.ipaddr "$IP"
+	setv network.lan.netmask 255.255.255.0
+	if [ "$WANT" = box ]; then
+		delv dhcp.lan.ignore "DHCP server on"
+		delv firewall.lan_lte "satellite forwarding lan -> lte"
+		delv firewall.lte "satellite zone on the modems"
+		box_base
+	else
+		setv dhcp.lan.ignore 1
+		# the zone lte + forwarding lan -> lte are added by sheaf-run itself once it runs as a satellite (sat_up)
+	fi
+}
+
+echo "sheaf-role $WANT${N:+ $N}: now $OLDROLE, LAN $(get network.lan.ipaddr)"
+APPLY=0; plan
+if [ $NPLAN = 0 ]; then
+	echo "  nothing to change: already $WANT${N:+ $N}"
+	exit 0
+fi
+[ "$DRYRUN" = 1 ] && { echo "(dry run: nothing changed)"; exit 0; }
+
+# --- backup, change, check -------------------------------------------------------------------------------------------
+mkdir -p "$BACKUPS" || die "cannot create $BACKUPS"
+B=$BACKUPS/$(date +%Y%m%d-%H%M%S); i=1
+while ! mkdir "$B" 2>/dev/null; do i=$((i + 1)); [ $i -gt 9 ] && die "cannot create a backup directory in $BACKUPS"; B=${B%-[0-9]}-$i; done
+for f in "$CONF" "$R/etc/config/network" "$R/etc/config/dhcp" "$R/etc/config/firewall"; do
+	cp -p "$f" "$B/" || die "backup of $f to $B failed: nothing changed"
+done
+for d in "$BACKUPS"/*/; do [ -d "$d" ] && echo "$d"; done | sort -r | tail -n +6 | while read -r d; do rm -rf "$d"; done
+echo "  backup: $B"
+
+APPLY=1; plan >/dev/null
+# the role as sheaf-run will read it; wrong = undo both (conf from the backup, uci staged changes reverted)
+read_role
+if [ "$CR:$C1:$C2" != "$WANT:$S1:$S2" ]; then
+	cp -p "$B/sheaf.conf" "$CONF"; for p in $CHANGED; do u revert "$p"; done
+	die "$CONF still says role $CR $C1 $C2 after the edit (set somewhere else in the file?): nothing changed"
+fi
+for p in $CHANGED; do u commit "$p" || die "uci commit $p failed (backup in $B)"; done
+
+# --- apply, detached -------------------------------------------------------------------------------------------------
+# the old satellite's runtime rules for the hub's sources (stop_all of sheaf-run removes only one rule per table);
+# a new satellite role gets its own from sheaf-run (sat_up)
+RULES="$OLD1 $OLD2"
+FWR=; case " $CHANGED " in *" firewall "*) FWR='/etc/init.d/firewall reload;' ;; esac
+JOB="/etc/init.d/sheaf stop; /usr/sbin/sheaf-run stop; sleep 3
+	for s in $RULES; do i=0; while [ \$i -lt 4 ] && ip rule del from \$s 2>/dev/null; do i=\$((i+1)); done; done
+	/etc/init.d/network reload; sleep 2; $FWR /etc/init.d/dnsmasq restart; sleep 5; /etc/init.d/sheaf start"
+if [ -n "$R" ]; then
+	echo "(ROOT set: the detached part is not run) $JOB"
+else
+	setsid sh -c "{ $JOB; } >/tmp/sheaf-role.log 2>&1" </dev/null >/dev/null 2>&1 &
+fi
+echo "sheaf-role: now $WANT${N:+ $N}, LAN $IP/24 in a few seconds (sheaf restarting)."
+[ "$WANT" = box ] && echo "  DHCP server on: it serves 192.168.1.x on whatever its LAN port is cabled to; reach it from a computer there."
+[ "$WANT" = satellite ] && echo "  DHCP off: reach the box from the hub's port (10.77.$N.1) or with a static address in 10.77.$N.0/24."
+exit 0

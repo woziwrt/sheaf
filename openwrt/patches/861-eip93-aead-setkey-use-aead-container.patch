@@ -1,0 +1,27 @@
+From: Petr Wozniak
+Subject: crypto: mtk-eip93: aead setkey must take the template from alg.aead.base
+
+mtk_aead_setkey() looks the algorithm template up with
+container_of(..., alg.skcipher.base). On 6.12 with DMA_NONCOHERENT
+(MT7621) struct crypto_alg is 128-byte aligned and its offset differs
+between skcipher_alg (256) and aead_alg (128), so the template pointer
+is 128 bytes off, flags read as 0 and setkey returns -EINVAL. Every
+ESP state with authenc(hmac(*),cbc(aes)) offloaded to EIP93 fails with
+"RTNETLINK answers: Invalid argument" (xfrm state add).
+
+Tested on MikroTik RBM33G (OpenWrt 25.12.6, kernel 6.12.112): ESP
+aes256-sha256 and aes128-sha1 states are accepted and run through
+authenc(hmac(sha256-eip93),cbc(aes-eip93)); TCP over ESP between two
+namespaces, content verified.
+
+--- a/drivers/crypto/mtk-eip93/eip93-aead.c
++++ b/drivers/crypto/mtk-eip93/eip93-aead.c
+@@ -134,7 +134,7 @@
+ 	struct crypto_tfm *tfm = crypto_aead_tfm(ctfm);
+ 	struct mtk_crypto_ctx *ctx = crypto_tfm_ctx(tfm);
+ 	struct mtk_alg_template *tmpl = container_of(tfm->__crt_alg,
+-				struct mtk_alg_template, alg.skcipher.base);
++				struct mtk_alg_template, alg.aead.base);
+ 	u32 flags = tmpl->flags;
+ 	u32 nonce = 0;
+ 	struct crypto_authenc_keys keys;

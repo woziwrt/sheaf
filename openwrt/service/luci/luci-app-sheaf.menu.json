@@ -1,0 +1,8 @@
+{
+	"admin/services/sheaf": {
+		"title": "Sheaf",
+		"order": 60,
+		"action": { "type": "view", "path": "sheaf/mode" },
+		"depends": { "acl": [ "luci-app-sheaf" ] }
+	}
+}

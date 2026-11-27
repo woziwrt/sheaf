@@ -1,0 +1,90 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<!-- Copyright (C) 2026 Petr Wozniak -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sheaf – status</title>
+<style>
+:root { --bg:#f7f6f2; --fg:#1d1d1b; --muted:#6d6c66; --card:#fff; --line:#e2dfd6; --ok:#2f7d4f; --bad:#b3362c; --warn:#b07a12; }
+@media (prefers-color-scheme: dark) { :root { --bg:#161615; --fg:#ecebe5; --muted:#a2a199; --card:#212120; --line:#33322e; --ok:#6cc392; --bad:#ef7a6f; --warn:#e2b34f; } }
+body { background:var(--bg); color:var(--fg); font:15px/1.45 -apple-system, system-ui, sans-serif; margin:0; padding:14px; }
+h1 { font-size:19px; margin:0 0 2px; } .sub { color:var(--muted); font-size:13px; margin-bottom:12px; }
+.grid { display:grid; gap:10px; grid-template-columns:repeat(2, minmax(0, 1fr)); max-width:1100px; }
+@media (max-width: 640px) { .grid { grid-template-columns:minmax(0, 1fr); } }
+.card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:12px; }
+.card h2 { font-size:16px; margin:0 0 8px; display:flex; justify-content:space-between; }
+.big { font-size:26px; font-weight:600; } .unit { font-size:13px; color:var(--muted); }
+table { width:100%; border-collapse:collapse; font-size:14px; } td { padding:2px 0; vertical-align:top; } td:first-child { padding-right:10px; color:var(--muted); } td:last-child { text-align:right; font-variant-numeric:tabular-nums; overflow-wrap:anywhere; }
+.ok { color:var(--ok); } .bad { color:var(--bad); } .warn { color:var(--warn); }
+.pill { font-size:12px; padding:1px 8px; border-radius:20px; border:1px solid currentColor; }
+.muted { color:var(--muted); } .stale .card { opacity:.45; filter:grayscale(1); }
+</style>
+</head>
+<body>
+<h1>Sheaf – box status</h1>
+<div class="sub" id="sub">loading…</div>
+<div class="grid" id="grid"></div>
+<script>
+const $ = s => document.querySelector(s);
+const f1 = v => (v === undefined || v === null || v === '') ? '–' : (+v).toFixed(1);
+function sig(rsrp) { if (rsrp === '' ) return ''; const v = +rsrp; return v >= -90 ? 'ok' : v >= -105 ? 'warn' : 'bad'; }
+const mb = v => (v === undefined || v === null) ? '–' : v >= 1e9 ? (v / 1e9).toFixed(2) + ' GB' : (v / 1e6).toFixed(1) + ' MB';
+// state of one link: [label, class]; without a fresh status nothing is known about it
+function linkState(l, running) {
+  if (!running) return ['no status', 'muted'];
+  if (!l || l.dead || !(l.last_fb_ms >= 0 && l.last_fb_ms < 3000)) return ['down', 'bad'];
+  if (l.stuck) return ['stalled', 'warn'];
+  if (l.slow) return ['slow', 'warn'];
+  return ['up', 'ok'];
+}
+async function tick() {
+  try {
+    const r = await fetch('/cgi-bin/sheaf-status', {cache: 'no-store'}); const d = await r.json();
+    const s = d.sheaf || {}; const links = s.links || [];
+    // sheaf rewrites its status every second; judged by the box clock (d.now), the viewer's clock may differ
+    const age = (d.now && s.updated_unix) ? d.now - s.updated_unix : null;
+    const running = age !== null && age <= 5;
+    const linkOf = m => links.find(l => l.id === m.link); // paired by link number, never by position
+    const nameOf = l => (d.modems.find(m => m.link === l.id) || {}).name || 'link ' + l.id;
+    const total = links.reduce((a, l) => a + (l.rx_mbit || 0), 0);
+    const totalTx = links.reduce((a, l) => a + (l.tx_mbit || 0), 0);
+    const modeName = {speed:'Speed', smooth:'Smooth', redundant:'Redundant', backup:'Backup'}[s.mode] || s.mode || '?';
+    const state = running ? `<span class="ok">sheaf ${s.version || '?'} running</span>`
+      : `<strong class="bad">sheaf not running / not responding (${age === null ? 'no status' : 'status ' + age + ' s old'})</strong>`;
+    $('#sub').innerHTML = `${state} · mode ${modeName}${s.mode === 'backup' ? ' (primary L' + s.primary + ')' : ''} · tunnel ${d.tunnel_ip || '–'} · box up ${Math.floor(d.uptime_s/60)} min · ${new Date((d.now || Date.now() / 1000) * 1000).toLocaleTimeString()}`;
+    let h = `<div class="card"><h2>Total download</h2><div class="big">${f1(total)} <span class="unit">Mbit/s</span></div>
+      <table><tr><td>packets delivered</td><td>${s.delivered ?? '–'}</td></tr><tr><td>download losses repaired (NACK)</td><td>${s.nacked ?? '–'}${s.delivered ? ' (' + (100 * s.nacked / s.delivered).toFixed(1) + ' %)' : ''}</td></tr>
+      <tr><td>ACKs sent at once</td><td>${s.nodelay ?? '–'}</td></tr>${s.mode === 'smooth' ? `<tr><td>UDP passed without waiting for a gap</td><td>${s.live_early ?? 0}</td></tr>` : ''}
+      <tr><td>held for reordering</td><td>${s.buffered ?? '–'}</td></tr></table></div>
+      <div class="card"><h2>Total upload</h2><div class="big">${f1(totalTx)} <span class="unit">Mbit/s</span></div>
+      <table>${links.map(l => `<tr><td>${nameOf(l)}</td><td>${f1(l.tx_mbit)} Mbit/s</td></tr>`).join('')}
+      <tr><td>duplicated (small important ones: DNS, connection setup, control)</td><td>${s.dup_sent ?? '–'}</td></tr>
+      <tr><td>retransmitted after timeout</td><td>${s.rtx ?? '–'}</td></tr></table></div>`;
+    d.modems.forEach(m => {
+      const lk = linkOf(m), l = lk || {}; const [st, cls] = linkState(lk, running);
+      h += `<div class="card"><h2>${m.name} <span class="pill ${cls}">${st}</span></h2>
+        <div class="big">${f1(l.rx_mbit)} <span class="unit">Mbit/s down · ${f1(l.tx_mbit)} up</span></div>
+        <table>
+        <tr><td>learned queue (upload)</td><td>${l.max_queue_ms ? f1(l.max_queue_ms).replace('.0', '') + ' ms' : '–'}</td></tr>
+        <tr><td>upload loss (last window) / slowdowns due to loss</td><td class="${(l.loss_pct || 0) > 5 ? 'warn' : ''}">${f1(l.loss_pct)} % / ${l.loss_cuts ?? '–'}</td></tr>
+        <tr><td>link outages / redials</td><td class="${(l.dead_count || m.redials) ? 'warn' : ''}">${l.dead_count ?? '–'} / ${m.redials ?? '–'}</td></tr>
+        <tr><td>slow / stalled (times)</td><td class="${(l.slow || l.stuck) ? 'warn' : ''}">${l.slow_count ?? '–'} / ${l.stuck_count ?? '–'}</td></tr>
+        <tr><td>RTT (now / base)</td><td>${f1(l.srtt_ms)} / ${f1(l.min_rtt_ms)} ms</td></tr>
+        <tr><td>signal RSRP / SINR</td><td class="${sig(m.rsrp)}">${m.rsrp || '–'} dBm / ${m.sinr || '–'} dB</td></tr>
+        <tr><td>network · cell · PCI</td><td>${m.rat || '–'} · ${m.cell || '–'} · ${m.pci || '–'}</td></tr>
+        <tr><td>IPsec</td><td class="${m.ipsec.up ? 'ok' : 'bad'}">${m.ipsec.up ? 'established' + (m.ipsec.mode ? ' · ' + m.ipsec.mode : '') : 'NO'}</td></tr>
+        ${m.ipsec.up ? `<tr><td>data cipher (ESP)</td><td>${m.ipsec.esp.replace('ESP:', '')}</td></tr>
+        <tr><td>key exchange (IKE)</td><td>${m.ipsec.ike}</td></tr>
+        <tr><td>rekey in</td><td>ESP ${m.ipsec.esp_rekey} · IKE ${m.ipsec.ike_rekey}</td></tr>` : ''}
+        ${m.rx_bytes !== null && m.rx_bytes !== undefined ? `<tr><td>SIM data (since the modem came up)</td><td>↓ ${mb(m.rx_bytes)} · ↑ ${mb(m.tx_bytes)}</td></tr>` : ''}
+        <tr><td>modem address</td><td>${m.ip || '–'}</td></tr></table></div>`;
+    });
+    $('#grid').innerHTML = h; $('#grid').classList.toggle('stale', !running);
+  } catch (e) { $('#sub').innerHTML = '<strong class="bad">sheaf not responding</strong> '; $('#sub').append('(' + e + ')'); $('#grid').classList.add('stale'); }
+}
+tick(); setInterval(tick, 2000);
+</script>
+</body>
+</html>

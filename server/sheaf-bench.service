@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Petr Wozniak
+[Unit]
+Description=sheaf test endpoints on localhost (sink 5201, source 5202: SRC_MB, default 50)
+After=network.target
+
+[Service]
+Environment=SRC_MB=50
+EnvironmentFile=-/opt/sheaf/bench.env
+ExecStart=/bin/sh -c '/opt/sheaf/tcpbench -listen 127.0.0.1:5201 & exec /opt/sheaf/tcpbench -listen 127.0.0.1:5202 -send ${SRC_MB}'
+KillMode=control-group
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

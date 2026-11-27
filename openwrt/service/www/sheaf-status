@@ -1,0 +1,60 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Petr Wozniak
+# Read-only status of the bond for the status page (/sheaf.html): sheaf's own JSON, the latest radio sample of
+# each modem, the IPsec SAs and the modem addresses. LAN only (uhttpd), no settings.
+echo "Content-Type: application/json"
+echo "Cache-Control: no-store"
+echo
+r() { tail -40 /tmp/radio.csv 2>/dev/null | grep ",$1," | tail -1; }
+ip_of() { ip -4 -o addr show dev $1 2>/dev/null | awk '{print $4}' | cut -d/ -f1; }
+addr_of() { case $1 in *.*) echo $1 ;; *) ip_of $1 ;; esac; } # a hub's link card carries its source address
+# all IPsec SAs in one swanctl call per request (it was one per modem); sa() picks one IKE SA's block out of it
+SAS=$(swanctl --list-sas 2>/dev/null)
+sa() { # IKE + CHILD SA of one modem: state, algorithms, rekey, byte counters
+	printf '%s\n' "$SAS" | awk -v want="sheaf-$1:" '
+		/^[^ ]/ { cur = ($1 == want) } # an IKE SA starts at column 0, its details and CHILD SAs are indented
+		!cur { next }
+		/ESTABLISHED/ { up = 1 }
+		index($0, "PRF_") && !ike { ike = $1 }
+		/established .* ago, rekeying in/ { for (i = 1; i <= NF; i++) if ($i == "in") ikerk = $(i+1) }
+		/INSTALLED/ { mode = $6; sub(",", "", mode); esp = $NF }
+		/installed .* ago, rekeying in/ { for (i = 1; i <= NF; i++) if ($i == "in" && $(i-1) == "rekeying") esprk = $(i+1); sub(",", "", esprk) }
+		/^    in  / { bi = $3 } /^    out / { bo = $3 }
+		END { printf "{\"up\":%s,\"ike\":\"%s\",\"esp\":\"%s\",\"mode\":\"%s\",\"ike_rekey\":\"%s\",\"esp_rekey\":\"%s\",\"in_bytes\":%s,\"out_bytes\":%s}",
+			up ? "true" : "false", ike, esp, mode, ikerk, esprk, bi ? bi : 0, bo ? bo : 0 }'
+}
+# sheaf numbers its links 1, 2, ... in the order of -links; sheaf-run writes their IKE ids in that order. A card is
+# paired with its link by this number, never by position (with one modem missing, link 1 is the second modem)
+IDS=$(cat /tmp/sheaf-links.ids 2>/dev/null)
+link_no() { local n=0 x; for x in $IDS; do n=$((n+1)); [ "$x" = "$1" ] && { echo $n; return; }; done; echo 0; }
+# names and IPsec ids from the service settings (box 1 defaults); a hub shows one card per link through a satellite
+ROLE=box; ID1=o2; ID2=vf; NAME1=O2; NAME2=Vodafone; HUB_LINKS=; HUB_NAMES=
+[ -f /etc/sheaf/sheaf.conf ] && . /etc/sheaf/sheaf.conf 2>/dev/null
+cards="wwan0:$ID1:$NAME1 wwan1:$ID2:$NAME2"
+if [ "$ROLE" = hub ]; then
+	cards=; i=0
+	for x in $HUB_LINKS; do
+		i=$((i+1)); src=${x%%:*}; id=${x##*:}; nm=$(echo $HUB_NAMES | cut -d' ' -f$i)
+		cards="$cards $src:$id:${nm:-link_$i}"
+	done
+fi
+# now = the box clock, read next to the status file: the page judges sheaf's updated_unix against it, not against
+# the viewer's clock
+NOW=$(date +%s)
+printf '{"sheaf":%s,' "$(cat /tmp/sheaf-status.json 2>/dev/null || echo null)"
+printf '"modems":['
+first=1
+for m in $cards; do
+	ifc=${m%%:*}; rest=${m#*:}; id=${rest%%:*}; name=$(echo "${rest#*:}" | tr _ ' ')
+	IFS=, read up dev rat rsrp sinr rsrq cell pci arfcn <<R
+$(r $ifc)
+R
+	# bytes through the modem's interface since it came up (all traffic of the SIM); null for a hub's address card
+	rxb=null; txb=null; st=/sys/class/net/$ifc/statistics
+	[ -r $st/rx_bytes ] && { read rxb < $st/rx_bytes; read txb < $st/tx_bytes; }
+	[ $first = 1 ] || printf ','; first=0
+	printf '{"name":"%s","if":"%s","link":%s,"ip":"%s","rat":"%s","rsrp":"%s","sinr":"%s","rsrq":"%s","cell":"%s","pci":"%s","earfcn":"%s","redials":%s,"rx_bytes":%s,"tx_bytes":%s,"ipsec":%s}' \
+		"$name" "$ifc" "$(link_no $id)" "$(addr_of $ifc)" "$rat" "$rsrp" "$sinr" "$rsrq" "$cell" "$pci" "$arfcn" "$(cat /tmp/sheaf-redials.$ifc 2>/dev/null || echo 0)" "$rxb" "$txb" "$(sa $id)"
+done
+printf '],"now":%s,"uptime_s":%s,"tunnel_ip":"%s"}\n' "$NOW" "$(cut -d. -f1 /proc/uptime)" "$(ip_of shf0)"

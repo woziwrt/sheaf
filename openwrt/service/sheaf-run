@@ -1,0 +1,836 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Petr Wozniak
+# Supervisor of the bond on the RBM33G: dial both modems, policy routing per modem, IPsec (IKEv2 to the server,
+# ESP transport for sheaf's UDP, trap policies: nothing leaves unencrypted), sheaf itself. Re-checks every 10 s:
+# a modem without session or with a new address is redialled and its IPsec reloaded; dead processes are restarted;
+# a link that stays dead anyway climbs a recovery ladder (IKE, redial, modem reset, USB).
+# Settings: /etc/sheaf/sheaf.conf. Log: logread -e sheaf.
+CONF=/etc/sheaf/sheaf.conf
+SRV=203.0.113.10; FRAME=1328; IPSEC=1; GOMAXPROCS=2; APN=internet
+# Go heap soft limit: the GC works harder near it instead of growing towards the box's 256 MB (a repair hole
+# held for many seconds); sheaf runs at ~12 MB RSS
+GOMEMLIMIT=96MiB
+# IPsec algorithms: AES-CBC + SHA2 for the RBM33G (its EIP93 has no GCM); a hub with ARMv8 CE (BPI-R4) runs AES-GCM:
+# IKE_PROP=aes256gcm16-prfsha384-ecp384; ESP_PROP=aes256gcm16-ecp384. ECP-384 always (never DH 14).
+IKE_PROP=aes256-sha384-ecp384; ESP_PROP=aes256-sha256-ecp384
+# identity of this box on the server (one server instance per box): IKE ids <ID1|ID2>.<BOX>.sheaf, server ports,
+# tunnel address. Defaults = box 1.
+BOX=box1; ID1=o2; ID2=vf; PORT1=47001; PORT2=47002; TUN=10.66.0.2/30; TUNGW=10.66.0.1
+# the LAN's interface: what arrives on it is routed only into the tunnel (lan_guard)
+LAN_IF=br-lan
+# role: box = modems + IPsec + sheaf (one box on its own); satellite = only dial the modems and route the hub's links
+# through them (SAT_SRC1/2 = the hub's source address for modem 1/2, NAT, no IPsec, no sheaf); hub = no modems, sheaf
+# + IPsec over HUB_LINKS "source:localport:serverport:satellite:id" on HUB_IF (e.g. an x86 box such as a UP Squared with RBM33G satellites)
+ROLE=box; SAT_SRC1=; SAT_SRC2=; HUB_IF=eth1; HUB_LINKS=
+# modem type and the USB path of modem 1/2: huawei = ME909s on the RBM33G (NCM, dialled with AT, DHCP);
+# qmi = a QMI module (qmi_wwan), dialled with uqmi, raw IP; mbim = an MBIM module (cdc_mbim),
+# dialled with umbim. M.2 slots of a BPI-R4 Pro 8X: CN18 = 4-1.2, CN21 = 4-1.4
+MODEM=huawei; USB1=1-2; USB2=1-1
+# transparent TCP proxy (tproxy_sync): TPROXY=1 = the LAN's TCP to public addresses goes through sheaf's proxy
+# (listener TPORT), not the tunnel; BLOCK_QUIC=1 also rejects UDP 443 from the LAN (browsers fall back to TCP)
+TPROXY=0; TPORT=5300; BLOCK_QUIC=0
+# FLOWTABLE=1: forwarded LAN <-> tunnel flows take the kernel's flowtable shortcut after their first packets (ft_sync)
+FLOWTABLE=1
+[ -f $CONF ] && . $CONF
+export GOMAXPROCS GOMEMLIMIT
+log() { logger -t sheaf "$*"; echo "$*"; }
+
+# modem: usb path, interface, routing table, sheaf port, server port, IKE id
+MODEMS="$USB1:wwan0:100:7001:$PORT1:$ID1 $USB2:wwan1:101:7002:$PORT2:$ID2"
+[ "$ROLE" = hub ] && MODEMS=
+# tmo SECONDS CMD...: run with a time limit (a hung charon must not freeze the supervisor; busybox has no timeout).
+# The killer's sleep must not hold our stdout: in $(tmo ...) the substitution waited for it, always SECONDS long
+tmo() { local s=$1 p w; shift; "$@" & p=$!; ( sleep $s; kill $p 2>/dev/null ) </dev/null >/dev/null 2>&1 & w=$!; wait $p; local r=$?; kill $w 2>/dev/null; return $r; }
+ike_ids() { local x; for x in $MODEMS $HUB_LINKS; do echo ${x##*:}; done; }
+# ike_down ID...: end the IKE SAs of these links. --force: do not wait for the delete exchange - on an address that no
+# longer exists it would wait ~165 s
+ike_down() { local id; for id in "$@"; do tmo 8 swanctl --terminate --ike sheaf-$id --force -t 5 >/dev/null 2>&1; done; }
+# not killall: it also hits /etc/init.d/sheaf. Waits until it is gone (up to 5 s): shf0 is attached to one sheaf at a
+# time, a new one started too early would find it busy
+sheaf_kill() {
+	local p i=0
+	tproxy_off # no redirect to a listener that is going away: new LAN TCP goes into shf0 meanwhile
+	for p in $(pgrep -f "^/usr/sbin/sheaf "); do kill $p; done
+	while pgrep -f "^/usr/sbin/sheaf " >/dev/null && [ $i -lt 5 ]; do sleep 1; i=$((i+1)); done
+	# a hung or stopped one ignores TERM and keeps its sockets: the next one then dies on "address already in use"
+	# and the box loops without a tunnel (T16, 26 Nov: kill -STOP). KILL works on both.
+	pgrep -f "^/usr/sbin/sheaf " >/dev/null || return 0
+	log "sheaf did not end on TERM in 5 s: killing it"
+	for p in $(pgrep -f "^/usr/sbin/sheaf "); do kill -9 $p; done; sleep 1
+}
+# links that can carry IPsec now: "address localport serverport id"
+link_list() {
+	local x usb ifc tbl lp sp id ip gw src
+	for x in $MODEMS; do
+		IFS=: read usb ifc tbl lp sp id <<M
+$x
+M
+		read ip gw 2>/dev/null < /tmp/sheaf-lease.$ifc && echo "$ip $lp $sp $id"
+	done
+	for x in $(hub_links); do
+		IFS=: read src lp sp gw id <<L
+$x
+L
+		echo "$src $lp $sp $id"
+	done
+}
+
+tty() { ls /sys/bus/usb/devices/$1:2.4/ 2>/dev/null | grep -o 'ttyUSB[0-9]*' | head -1; }
+at() { # tty, command -> answer in /tmp/sheaf-at.$1 (sms_tool may hang on unsolicited messages: kill after 4 s)
+	sms_tool -d /dev/$1 at "$2" > /tmp/sheaf-at.$1 2>&1 & p=$!
+	( sleep 4; kill $p 2>/dev/null ) & w=$!
+	wait $p 2>/dev/null; kill $w 2>/dev/null
+}
+dialed() { at $1 'AT^NDISSTATQRY?'; grep -q 'NDISSTATQRY: 1,' /tmp/sheaf-at.$1; }
+# the periodic check redials only on an explicit "not connected": an empty or garbled answer (a busy port, an
+# unsolicited message in between) is "unknown" and leaves the link alone - a redial flushes its address
+undialed() { at $1 'AT^NDISSTATQRY?'; grep -q 'NDISSTATQRY: 0,' /tmp/sheaf-at.$1; }
+cat > /tmp/sheaf-dhcp.sh <<'U'
+#!/bin/sh
+[ "$1" = bound ] && { ip addr flush dev $interface; ip addr add $ip/32 dev $interface; echo "$ip $router" > /tmp/sheaf-lease.$interface; }
+exit 0
+U
+chmod +x /tmp/sheaf-dhcp.sh
+
+huawei_dial() { # usb, if, apn -> /tmp/sheaf-lease.$ifc
+	local usb=$1 ifc=$2 apn=$3 t try
+	t=$(tty $usb); [ -n "$t" ] || { log "$ifc: modem not found ($usb)"; return 1; }
+	qmi_name $usb $ifc || true # its slot's name: a no-op when the kernel already named it so (both modems Huawei)
+	for try in 1 2 3; do
+		dialed $t && break
+		at $t "AT^NDISDUP=1,1,\"$apn\""; sleep 2
+	done
+	dialed $t || { log "$ifc: dial failed"; return 1; }
+	ip link set $ifc up
+	udhcpc -i $ifc -q -n -t 3 -T 2 -s /tmp/sheaf-dhcp.sh >/dev/null 2>&1
+}
+
+# QMI modems (MODEM=qmi). The modem is found by its USB path, never by the order it enumerated in: its control
+# device (cdc-wdmN) and its network interface, which is renamed to wwan0/wwan1 so the rest of the script stays the same.
+wdm() { local d; for d in /sys/bus/usb/devices/$1/$1:1.*/usbmisc/cdc-wdm*; do [ -e "$d" ] && { basename $d; return; }; done; }
+qnet() { local d; for d in /sys/bus/usb/devices/$1/$1:*.*/net/*; do [ -e "$d" ] && { basename $d; return; }; done; } # any USB configuration (Huawei: 2)
+q() { local w=$1; shift; tmo 10 uqmi -s -d /dev/$w "$@" 2>/dev/null; } # uqmi can hang on a modem that is rebooting
+jval() { sed -n "s/.*\"$1\":\"\{0,1\}\([^\",}]*\).*/\1/p" | head -1; } # key -> value from uqmi's one-line JSON
+qmi_name() { # usb, wanted name: give the modem's interface the name of its slot (swap away whoever holds it)
+	local cur; cur=$(qnet $1); [ -n "$cur" ] || return 1
+	[ "$cur" = "$2" ] && return 0
+	[ -e /sys/class/net/$2 ] && { ip link set $2 down; ip link set $2 name ${2}x; }
+	ip link set $cur down; ip link set $cur name $2
+}
+qmi_dialed() { local w; w=$(wdm $1); [ -n "$w" ] && q $w --get-data-status | grep -q '"connected"'; }
+qmi_dial() { # usb, if, apn -> /tmp/sheaf-lease.$ifc
+	local usb=$1 ifc=$2 apn=$3 w cid s ip gw
+	w=$(wdm $usb); [ -n "$w" ] || { log "$ifc: modem not found ($usb)"; return 1; }
+	qmi_name $usb $ifc || { log "$ifc: modem $usb has no network interface"; return 1; }
+	cid=$(cat /tmp/sheaf-cid.$ifc 2>/dev/null)
+	if [ -n "$cid" ]; then # a session of ours that is no longer good: end it, a new one starts below
+		q $w --set-client-id wds,$cid --stop-network 0xffffffff --autoconnect >/dev/null
+		q $w --set-client-id wds,$cid --release-client-id wds >/dev/null
+	fi
+	ip link set $ifc down
+	q $w --wda-set-data-format raw-ip >/dev/null
+	echo Y > /sys/class/net/$ifc/qmi/raw_ip 2>/dev/null
+	cid=$(q $w --get-client-id wds)
+	case "$cid" in ''|*[!0-9]*) log "$ifc: no QMI client ($cid)"; rm -f /tmp/sheaf-cid.$ifc; return 1 ;; esac
+	echo $cid > /tmp/sheaf-cid.$ifc
+	q $w --set-client-id wds,$cid --keep-client-id wds --start-network --apn "$apn" --ip-family ipv4 >/dev/null
+	s=$(q $w --set-client-id wds,$cid --keep-client-id wds --get-current-settings | tr -d '\n ')
+	ip=$(echo "$s" | jval ip); gw=$(echo "$s" | jval gateway)
+	[ -n "$ip" ] && [ -n "$gw" ] || { log "$ifc: dial failed ($s)"; return 1; }
+	ip link set $ifc up
+	ip addr flush dev $ifc; ip addr add $ip/32 dev $ifc
+	echo "$ip $gw" > /tmp/sheaf-lease.$ifc
+}
+qmi_stop() { # usb, if
+	local w cid; w=$(wdm $1); cid=$(cat /tmp/sheaf-cid.$2 2>/dev/null)
+	[ -n "$w" ] && [ -n "$cid" ] && { q $w --set-client-id wds,$cid --stop-network 0xffffffff --autoconnect >/dev/null
+		q $w --set-client-id wds,$cid --release-client-id wds >/dev/null; }
+	rm -f /tmp/sheaf-cid.$2
+}
+# MBIM modems (MODEM=mbim), dialled with umbim the way OpenWrt's own mbim.sh does it: one MBIM session per modem,
+# every request carries the next transaction id (kept in /tmp/sheaf-mbimtid.<if>), -n keeps the session open; the
+# address and gateway come from the modem (config), no DHCP. Control device and interface as for QMI (wdm, qmi_name).
+# Home network only (registration code 0), like mbim.sh by default: roaming is not dialled.
+mb() { local w=$1; shift; tmo 15 umbim -d /dev/$w "$@" 2>/dev/null; }
+mval() { sed -n "s/^[[:space:]]*$1:[[:space:]]*\([0-9.]*\).*/\1/p" | head -1; } # field of umbim's config output
+mbim_stop() { # usb, if: close our session (if any)
+	local w t; w=$(wdm $1); t=$(cat /tmp/sheaf-mbimtid.$2 2>/dev/null)
+	[ -n "$w" ] && [ -n "$t" ] && mb $w -t $t disconnect >/dev/null
+	rm -f /tmp/sheaf-mbimtid.$2
+}
+mbim_dial() { # usb, if, apn -> /tmp/sheaf-lease.$ifc
+	local usb=$1 ifc=$2 apn=$3 w t r c ip gw
+	command -v umbim >/dev/null || { log "$ifc: MODEM=mbim needs umbim and kmod-usb-net-cdc-mbim"; return 1; }
+	w=$(wdm $usb); [ -n "$w" ] || { log "$ifc: modem not found ($usb)"; return 1; }
+	qmi_name $usb $ifc || { log "$ifc: modem $usb has no network interface"; return 1; }
+	mbim_stop $usb $ifc
+	ip link set $ifc down
+	mb $w -n caps >/dev/null || { log "$ifc: MBIM modem does not answer"; mb $w -t 3 disconnect >/dev/null; return 1; }
+	t=3 # as mbim.sh: the open and caps use the ids before 3
+	mb $w -n -t $t subscriber >/dev/null || { log "$ifc: no SIM ready (PIN?)"; mb $w -t $((t+1)) disconnect >/dev/null; return 1; }
+	t=$((t+1)); mb $w -n -t $t registration >/dev/null; r=$?; t=$((t+1))
+	[ $r = 0 ] || { log "$ifc: not registered in the home network (code $r)"; mb $w -t $t disconnect >/dev/null; return 1; }
+	mb $w -n -t $t attach >/dev/null || { log "$ifc: attach failed"; mb $w -t $((t+1)) disconnect >/dev/null; return 1; }
+	t=$((t+1)); mb $w -n -t $t connect "ipv4:$apn" >/dev/null || { log "$ifc: connect failed"; mb $w -t $((t+1)) disconnect >/dev/null; return 1; }
+	t=$((t+1)); c=$(mb $w -n -t $t config); t=$((t+1))
+	echo $t > /tmp/sheaf-mbimtid.$ifc
+	ip=$(echo "$c" | mval ipv4address); gw=$(echo "$c" | mval ipv4gateway)
+	[ -n "$ip" ] && [ -n "$gw" ] || { log "$ifc: dial failed (no address from the modem)"; mbim_stop $usb $ifc; return 1; }
+	ip link set $ifc up
+	ip addr flush dev $ifc; ip addr add $ip/32 dev $ifc
+	echo "$ip $gw" > /tmp/sheaf-lease.$ifc
+}
+mbim_dialed() { # usb, if: the modem still reports our address
+	local w t ip gw; w=$(wdm $1); t=$(cat /tmp/sheaf-mbimtid.$2 2>/dev/null)
+	[ -n "$w" ] && [ -n "$t" ] || return 1
+	read ip gw 2>/dev/null < /tmp/sheaf-lease.$2 || return 1
+	echo $((t+1)) > /tmp/sheaf-mbimtid.$2
+	[ "$(mb $w -n -t $t config | mval ipv4address)" = "$ip" ]
+}
+
+# the modem is there / is dialled (its own view): per type
+# the type is per modem: MODEM_wwan1=mbim overrides MODEM for one slot (one module swapped, the other kept)
+mtype() { eval echo \${MODEM_$1:-$MODEM}; } # interface -> huawei | qmi | mbim
+present() { case $(mtype $2) in qmi|mbim) [ -n "$(wdm $1)" ] ;; *) [ -n "$(tty $1)" ] ;; esac; } # usb, if
+mundialed() { case $(mtype $2) in qmi) ! qmi_dialed $1 ;; mbim) ! mbim_dialed $1 $2 ;; *) undialed $(tty $1) ;; esac; } # usb, if
+
+# a modem that is there but keeps failing to dial (no signal, no SIM, no credit) is tried less and less often: 10 s,
+# 20 s, 40 s ... 5 min. One attempt can take ~30 s and the loop is sequential: without this it held up the other
+# modem's checks, IPsec and sheaf's watchdog in every round. Uptime, not the clock (NTP steps it). A missing modem
+# fails at once and is not backed off: it is seen as soon as it is back.
+now_s() { cut -d. -f1 /proc/uptime; }
+dial_due() { local due d; read due d 2>/dev/null < /tmp/sheaf-backoff.$1 || return 0; [ "$(now_s)" -ge "$due" ]; } # if
+dial_failed() { # if: the next attempt later
+	local due d; read due d 2>/dev/null < /tmp/sheaf-backoff.$1 || d=5
+	d=$((d * 2)); [ $d -gt 300 ] && d=300
+	echo "$(( $(now_s) + d )) $d" > /tmp/sheaf-backoff.$1; log "$1: next dial attempt in $d s"
+}
+
+modem_up() { # usb, if, table -> 0 when the interface has an address and routes
+	local usb=$1 ifc=$2 tbl=$3 ip gw apn
+	eval apn=\${APN_$ifc:-$APN} # per-modem APN (APN_wwan0=...) or the common one
+	rm -f /tmp/sheaf-lease.$ifc
+	case $(mtype $ifc) in qmi) qmi_dial $usb $ifc "$apn" ;; mbim) mbim_dial $usb $ifc "$apn" ;; *) huawei_dial $usb $ifc "$apn" ;; esac || return 1
+	read ip gw 2>/dev/null < /tmp/sheaf-lease.$ifc || { log "$ifc: no address"; return 1; }
+	ip route replace $gw dev $ifc
+	ip route replace default via $gw dev $ifc metric $tbl
+	ip rule del table $tbl 2>/dev/null; ip rule del table $tbl 2>/dev/null
+	ip rule add from $ip table $tbl
+	ip route replace $gw dev $ifc table $tbl
+	ip route replace default via $gw dev $ifc table $tbl
+	ip route replace unreachable default metric 65535 table $tbl # modem route gone: no fall-through to the other modem
+	log "$ifc: up, $ip via $gw"
+}
+
+# our own swanctl file, loaded with --file: OpenWrt's swanctl service owns /var/swanctl/swanctl.conf and empties it on
+# every start, stop or reload (LuCI, apk) - with our connections in it the links lost their IPsec
+SWC=/var/sheaf/swanctl.conf
+# ipsec_conf: one IKE SA per link that has an address. Changed = return 0, and IKE_GONE = the links whose address
+# changed or disappeared since the last config ($SWC.links: "address localport serverport id"): only their IKE SAs
+# are ended. The others keep theirs - an unchanged connection survives the reload, and a new address of one modem
+# must not stop the other link for a new IKE exchange.
+ipsec_conf() {
+	local ip lp sp id
+	mkdir -p /var/sheaf
+	IKE_GONE=
+	link_list > $SWC.links.new
+	{
+	echo "include /etc/swanctl/conf.d/*.conf" # the PSK (sheaf-secret.conf)
+	echo "connections {"
+	while read ip lp sp id; do
+		cat <<C
+    sheaf-$id {
+        version = 2
+        local_addrs = $ip
+        remote_addrs = $SRV
+        proposals = $IKE_PROP
+        encap = yes
+        dpd_delay = 15s
+        keyingtries = 0
+        local { auth = psk
+                id = $id.$BOX.sheaf }
+        remote { auth = psk
+                 id = server.sheaf }
+        children { sheaf-$id { mode = transport
+                               local_ts = dynamic[udp/$lp]
+                               remote_ts = dynamic[udp/$sp]
+                               esp_proposals = $ESP_PROP
+                               replay_window = 1024
+                               start_action = trap
+                               dpd_action = trap
+                               close_action = trap } }
+    }
+C
+	done < $SWC.links.new
+	echo "}"
+	} > $SWC.new
+	if ! cmp -s $SWC.new $SWC; then
+		[ -f $SWC.links ] && IKE_GONE=$(while read ip lp sp id; do grep -qxF "$ip $lp $sp $id" $SWC.links.new || echo $id; done < $SWC.links)
+		mv $SWC.new $SWC; mv $SWC.links.new $SWC.links
+		return 0 # changed
+	fi
+	rm -f $SWC.new $SWC.links.new
+	return 1
+}
+
+charon_up() {
+	# OpenWrt's own swanctl service (procd, respawn) must not run a second charon next to ours: when ours was killed on a
+	# restart, procd started its own, which replaced the vici socket and died (exit 66), leaving charon without a
+	# listening vici socket and the links without IPsec (hub, 25 Nov). sheaf-run owns charon on this board.
+	[ -x /etc/init.d/swanctl ] && /etc/init.d/swanctl enabled && {
+		log "ipsec: disabling OpenWrt's swanctl service (sheaf-run runs charon itself)"
+		/etc/init.d/swanctl disable; /etc/init.d/swanctl stop >/dev/null 2>&1; killall charon 2>/dev/null; sleep 1; }
+	if pidof charon >/dev/null; then
+		tmo 5 swanctl --stats >/dev/null 2>&1 && return 0
+		log "ipsec: charon does not answer on vici, restarting it"
+		killall charon; sleep 2; killall -9 charon 2>/dev/null
+	fi
+	rm -f /var/run/charon.pid /var/run/charon.vici # left by a charon that died: the new one would not answer on vici
+	/usr/lib/ipsec/charon > /dev/null 2>&1 &
+	sleep 2
+	rm -f /tmp/sheaf-ipsec.loaded # a new charon has nothing loaded
+}
+
+# fail closed: with IPSEC=1 no sheaf UDP may leave unencrypted, whatever happens to charon or its config (25 Nov: a
+# dead vici left the links in plaintext and the server took it). The kernel drops what has no IPsec route; the trap
+# policies normally catch everything before this rule.
+ipsec_guard() {
+	local x a b c d rest ports=
+	for x in $MODEMS; do IFS=: read a b c d rest <<M
+$x
+M
+		ports="$ports${ports:+,}$d"; done
+	for x in $HUB_LINKS; do IFS=: read a b rest <<L
+$x
+L
+		ports="$ports${ports:+,}$b"; done
+	[ -n "$ports" ] || return 0
+	nft list table inet sheaf_ipsec >/dev/null 2>&1 && [ "$(cat /tmp/sheaf-guard.ports 2>/dev/null)" = "$ports" ] && return 0
+	nft delete table inet sheaf_ipsec 2>/dev/null
+	nft -f - <<N && log "ipsec: plaintext from ports $ports to $SRV is dropped"
+table inet sheaf_ipsec {
+	chain out {
+		type filter hook output priority 0; policy accept;
+		ip daddr $SRV udp sport { $ports } rt ipsec missing counter drop
+	}
+}
+N
+	echo "$ports" > /tmp/sheaf-guard.ports
+}
+# the trap policy of every link must be in the kernel; one missing (flushed, a foreign reload) = a new charon
+# instead of leaving that link dead behind the guard. Not the guard's counter: while IKE negotiates, the trap policy
+# routes the packets into a blackhole and the guard counts them too - that is normal.
+ipsec_policies() {
+	local ip lp sp id p; p=$(ip xfrm policy list dir out 2>/dev/null)
+	[ -f /tmp/sheaf-ipsec.loaded ] || return 0
+	link_list | while read ip lp sp id; do
+		echo "$p" | grep -q "^src $ip/32 dst $SRV/32 proto udp sport $lp dport $sp" && continue
+		# charon still believes its trap policies are installed, a reload would not put them back: start it afresh
+		log "ipsec: no policy for link $id ($ip:$lp): restarting charon"; rm -f /tmp/sheaf-ipsec.loaded
+		killall charon 2>/dev/null; sleep 2; killall -9 charon 2>/dev/null; break
+	done
+}
+
+# load the IPsec config until it succeeds (a failed load used to be forgotten: the file on disk "matched" afterwards)
+ipsec_load() {
+	if tmo 15 swanctl --load-all --file $SWC >/dev/null 2>&1; then
+		touch /tmp/sheaf-ipsec.loaded
+		log "ipsec: config (re)loaded ($(grep -c '^    sheaf-[a-z0-9]* {' $SWC) links)"
+	else
+		rm -f /tmp/sheaf-ipsec.loaded; log "ipsec: loading the config failed, retrying"
+	fi
+}
+
+# the tunnel: shf0 = $TUN (server $TUNGW; box 1: 10.66.0.2/30, server 10.66.0.1), default route of the board and its LAN (NATed by the firewall
+# zone "sheaf"); the board's own LTE traffic (IKE, ESP, sheaf's links) keeps its per-modem tables 100/101.
+# shf0 is a persistent TUN made here, not by sheaf: it outlives sheaf, so a restart of sheaf keeps the device, its
+# address, the routes and the firewall's NAT state, and the LAN's TCP connections survive it. While no sheaf reads it,
+# the kernel drops what is routed into it (no carrier) - silently, nothing falls through to the modems' default routes.
+# It stays after a stop of the service as well (the LAN stays shut off from the modems); a satellite removes it.
+tun_persistent() { local f; f=$(cat /sys/class/net/shf0/tun_flags 2>/dev/null) || return 1; [ $(( $f & 0x800 )) != 0 ]; } # IFF_PERSIST
+tun_make() {
+	tun_persistent && return 0
+	# one made by sheaf itself (an older sheaf-run before the upgrade): it goes with that sheaf
+	[ -e /sys/class/net/shf0 ] && { log "shf0 is not persistent (still held by an old sheaf)"; return 1; }
+	ip tuntap add dev shf0 mode tun || { log "cannot create shf0"; return 1; }
+	log "tunnel shf0 created (persistent)"
+}
+tun_up() {
+	ip link show shf0 >/dev/null 2>&1 || return 1
+	ip -4 addr show dev shf0 | grep -q "$TUN" || { ip addr flush dev shf0; ip addr replace $TUN dev shf0; }
+	ip link set shf0 mtu 1320 up
+	ip route replace default via $TUNGW dev shf0 metric 1
+}
+# second guard: whatever comes from the LAN is routed only into the tunnel, never to a modem's default route in main
+# (should shf0 or its route ever be gone). The LAN first sees main without its default routes (the box itself, the
+# LAN, the tunnel's own net), then its own table: the tunnel, behind it a blackhole (dropped silently, no reject: the
+# clients' TCP connections wait instead of being reset).
+LANT=102
+lan_guard() {
+	ip -4 addr show dev shf0 2>/dev/null | grep -q "inet ${TUN%/*}/" && ip route replace default via $TUNGW dev shf0 table $LANT
+	ip route replace blackhole default metric 65535 table $LANT
+	local r; r=$(ip rule show)
+	echo "$r" | grep -q "^900:.*lookup main suppress_prefixlength 0" ||
+		ip rule add iif $LAN_IF lookup main suppress_prefixlength 0 pref 900
+	echo "$r" | grep -q "^901:.*lookup $LANT\$" || ip rule add iif $LAN_IF lookup $LANT pref 901
+}
+# Transparent TCP proxy (TPROXY=1): new TCP connections from the LAN to public addresses - not to the server, not to
+# the box itself, not to private/special ranges (those keep using shf0) - are redirected to sheaf's listener (sheaf
+# -transparent, all addresses: it closes any connection that was not redirected) and carried as proxy streams; the
+# server dials them from its own address (-tallow there). Only a SYN is redirected, so connections already running
+# through shf0 stay there. The redirect exists only while sheaf runs AND listens: when it is gone, new connections
+# go into shf0 as before (dropped there while sheaf is down; nothing reaches a modem - the LAN guard holds). Proxied
+# connections end when sheaf restarts (they live in its process); tunnel connections survive that.
+# Own nft table (fw4 reloads leave it alone); the redirected SYN is accepted by the lan zone's input (ACCEPT by
+# default). BLOCK_QUIC=1: UDP 443 from the LAN is rejected (port unreachable at once, no timeout), so browsers use
+# TCP and with it the proxy instead of QUIC through the tunnel (~20 Mbit/s on the RBM33G).
+TPT=sheaf_tproxy
+tp_listening() { grep -q "^ *[0-9]*: 00000000:$(printf %04X $TPORT) 00000000:0000 0A" /proc/net/tcp; }
+tproxy_off() {
+	nft delete table inet $TPT 2>/dev/null && log "tproxy: redirect removed (LAN TCP through the tunnel)"
+	rm -f /tmp/sheaf-tproxy.sig
+	return 0
+}
+# Flowtable (nf_flow_table, software): once a forwarded LAN <-> shf0 connection is established (it went through fw4's
+# forward chain like any other), its packets skip the rest of the netfilter and routing path. On the RBM33G that
+# path is part of every write to the tunnel: tunnel downloads 20.7 -> 31.7 Mbit/s (ABBA 4+4, 26 Nov). Proxied TCP
+# is local, not forwarded: unaffected. Devices: the LAN bridge's ports (a flowtable takes ports, not the bridge)
+# and shf0 (persistent, so the table outlives sheaf restarts). Own table: fw4 reloads leave it alone.
+FTT=sheaf_ft
+ft_off() { nft delete table inet $FTT 2>/dev/null; rm -f /tmp/sheaf-ft.sig; return 0; }
+ft_sync() {
+	local devs d sig
+	[ "$FLOWTABLE" = 1 ] && [ -e /sys/class/net/shf0 ] || { ft_off; return 0; }
+	# fw4's own offloading (firewall defaults flow_offloading=1) takes br-lan + wan but not shf0; the same ports in two
+	# flowtables are asking for trouble, so with it on ours steps aside
+	if [ "$(uci -q get firewall.@defaults[0].flow_offloading)" = 1 ]; then
+		nft list table inet $FTT >/dev/null 2>&1 && log "flowtable: fw4 flow_offloading is on, ours removed (shf0 without the shortcut)"
+		ft_off; return 0
+	fi
+	devs=$(ls /sys/class/net/$LAN_IF/brif 2>/dev/null) || devs=
+	[ -n "$devs" ] || devs=$LAN_IF
+	sig=$(echo $devs shf0)
+	nft list table inet $FTT >/dev/null 2>&1 && [ "$(cat /tmp/sheaf-ft.sig 2>/dev/null)" = "$sig" ] && return 0
+	nft delete table inet $FTT 2>/dev/null
+	{ echo "table inet $FTT {"
+	  printf '\tflowtable ft {\n\t\thook ingress priority 0\n\t\tdevices = { %s }\n\t}\n' "$(echo $sig | sed 's/ /, /g')"
+	  printf '\tchain fw {\n\t\ttype filter hook forward priority filter - 5; policy accept;\n'
+	  printf '\t\tmeta l4proto { tcp, udp } flow add @ft\n\t}\n}\n'; } | nft -f - || { log "flowtable: nft failed, forwarding without it"; return 1; }
+	echo "$sig" > /tmp/sheaf-ft.sig; log "flowtable: forwarded flows between $sig take the shortcut"
+}
+tproxy_sync() {
+	local sig
+	[ "$TPROXY" = 1 ] && pgrep -f "^/usr/sbin/sheaf " >/dev/null && tp_listening || { tproxy_off; return 0; }
+	sig="$LAN_IF $TPORT $SRV $BLOCK_QUIC"
+	nft list table inet $TPT >/dev/null 2>&1 && [ "$(cat /tmp/sheaf-tproxy.sig 2>/dev/null)" = "$sig" ] && return 0
+	nft delete table inet $TPT 2>/dev/null
+	{ cat <<N
+table inet $TPT {
+	set direct {
+		type ipv4_addr; flags interval; auto-merge
+		elements = { 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.0.0.0/24,
+			192.0.2.0/24, 192.168.0.0/16, 198.18.0.0/15, 198.51.100.0/24, 203.0.113.0/24, 224.0.0.0/3, $SRV }
+	}
+	chain pre {
+		type nat hook prerouting priority dstnat - 10; policy accept;
+		iifname "$LAN_IF" tcp flags & (fin | syn | rst | ack) == syn fib daddr type != local ip daddr != @direct counter redirect to :$TPORT
+	}
+N
+	[ "$BLOCK_QUIC" = 1 ] && cat <<Q
+	chain quic {
+		type filter hook forward priority filter - 10; policy accept;
+		iifname "$LAN_IF" udp dport 443 counter reject
+	}
+Q
+	echo "}"; } | nft -f - || { log "tproxy: nft failed, LAN TCP stays in the tunnel"; return 1; }
+	echo "$sig" > /tmp/sheaf-tproxy.sig
+	log "tproxy: LAN TCP to public addresses -> sheaf :$TPORT$( [ "$BLOCK_QUIC" = 1 ] && echo ', UDP 443 from the LAN rejected')"
+}
+
+# a satellite routes the hub's links (from the LAN) out through its modems: no tunnel, no LAN guard
+tun_remove() {
+	while ip rule del pref 900 2>/dev/null; do :; done
+	while ip rule del pref 901 2>/dev/null; do :; done
+	ip route flush table $LANT 2>/dev/null
+	[ -e /sys/class/net/shf0 ] && { ip link del shf0 2>/dev/null; log "satellite: shf0 and the LAN guard removed"; }
+	return 0
+}
+
+# hub: each link leaves from its own address and is routed to its satellite (table 201, 202, ...). The port is the one
+# the satellite is reached through (a BPI-R4 has one port per satellite, each its own small network set up in
+# /etc/config/network); HUB_IF only when nothing routes there yet (one shared port + switch, as in the x86 UP Squared example)
+# only a directly connected satellite counts: with the port down "route get" would answer via the tunnel (shf0)
+hub_dev() { local r d; r=$(ip -4 route get $1 2>/dev/null | head -1)
+	case "$r" in *" via "*|'') d= ;; *) d=$(echo "$r" | sed -n 's/.* dev \([^ ]*\).*/\1/p') ;; esac; echo ${d:-$HUB_IF}; }
+# which satellites are connected (plug in one or two - or more, over a switch - and the hub uses what is
+# there). HUB_LINKS lists every possible link once; a satellite counts when it is directly connected (a route on one of
+# the hub's ports, not via the tunnel) and answers a ping. Inertia against flapping: in after 2 good checks in a row
+# (20 s), out after 3 bad ones (30 s). A satellite whose modems are down still counts: sheaf itself marks those links dead.
+hub_scan() {
+	local x src lp sp gw id r ok bad st act=
+	for gw in $(for x in $HUB_LINKS; do echo ${x#*:*:*:}; done | cut -d: -f1 | sort -u); do
+		r=$(ip -4 route get $gw 2>/dev/null | head -1)
+		case "$r" in *" via "*|'') ok=0 ;; *) ping -c 1 -W 1 $gw >/dev/null 2>&1 && ok=1 || ok=0 ;; esac
+		read st good bad 2>/dev/null < /tmp/sheaf-sat.$gw || { st=0; good=0; bad=0; }
+		if [ $ok = 1 ]; then good=$((good+1)); bad=0; else bad=$((bad+1)); good=0; fi
+		[ $st = 0 ] && [ $good -ge 2 ] && { st=1; log "satellite $gw connected"; }
+		[ $st = 1 ] && [ $bad -ge 3 ] && { st=0; log "satellite $gw gone"; }
+		echo "$st $good $bad" > /tmp/sheaf-sat.$gw
+		[ $st = 1 ] && act="$act $gw"
+	done
+	for x in $HUB_LINKS; do
+		IFS=: read src lp sp gw id <<L
+$x
+L
+		case " $act " in *" $gw "*) echo "$x" ;; esac
+	done > /tmp/sheaf-hub.active.new
+	mv /tmp/sheaf-hub.active.new /tmp/sheaf-hub.active
+}
+hub_links() { cat /tmp/sheaf-hub.active 2>/dev/null; }
+
+hub_up() {
+	local x src lp sp gw id dev k=200
+	for x in $HUB_LINKS; do
+		IFS=: read src lp sp gw id <<L
+$x
+L
+		k=$((k+1))
+		case " $(hub_links | tr '\n' ' ') " in *" $x "*) ;; *) continue ;; esac # table k stays with its link
+		dev=$(hub_dev $gw)
+		ip -4 addr show dev $dev | grep -q "inet $src/" || ip addr add $src/24 dev $dev
+		ip rule show | grep -q "from $src lookup $k" || ip rule add from $src table $k
+		ip route replace default via $gw dev $dev table $k
+		ip route replace unreachable default metric 65535 table $k # port down: the link must not fall into the tunnel
+	done
+}
+
+# satellite: the hub's link addresses leave through this box's modems (their tables 100/101), masqueraded
+sat_up() {
+	local i=0 x usb ifc tbl rest src
+	if ! uci -q get firewall.lte >/dev/null; then
+		uci set firewall.lte=zone; uci set firewall.lte.name=lte
+		uci add_list firewall.lte.device=wwan0; uci add_list firewall.lte.device=wwan1
+		uci set firewall.lte.input=REJECT; uci set firewall.lte.output=ACCEPT; uci set firewall.lte.forward=REJECT
+		uci set firewall.lte.masq=1; uci set firewall.lte.mtu_fix=1
+		uci set firewall.lan_lte=forwarding; uci set firewall.lan_lte.src=lan; uci set firewall.lan_lte.dest=lte
+		uci commit firewall; /etc/init.d/firewall reload >/dev/null 2>&1; log "satellite: firewall zone lte (masquerade) added"
+	fi
+	for x in $MODEMS; do
+		i=$((i+1))
+		IFS=: read usb ifc tbl rest <<M
+$x
+M
+		eval src=\$SAT_SRC$i
+		[ -n "$src" ] || continue
+		ip rule show | grep -q "from $src lookup $tbl" || ip rule add from $src table $tbl
+	done
+}
+
+# the links sheaf gets: on a box only the modems whose interface exists (one missing modem must not keep the other
+# off the air: binding to a missing device is fatal), each with its ifindex - a modem that re-enumerates on USB gets
+# a new ifindex and the old socket stays bound to the dead one, so a changed signature restarts sheaf
+link_sig() { local i; for i in wwan0 wwan1; do [ -e /sys/class/net/$i ] && printf '%s:%s ' $i $(cat /sys/class/net/$i/ifindex); done; }
+
+sheaf_up() {
+	local x src lp sp gw id spec= sig age
+	if pgrep -f "^/usr/sbin/sheaf " >/dev/null; then
+		sig=$(link_sig)
+		age=$(( $(date +%s) - $(date -r /tmp/sheaf-status.json +%s 2>/dev/null || echo 0) ))
+		[ "$ROLE" = hub ] && sig=$(hub_links | tr "\n" " ")
+		if [ "$sig" != "$(cat /tmp/sheaf-links.sig 2>/dev/null)" ]; then
+			log "links changed ($(cat /tmp/sheaf-links.sig 2>/dev/null)-> $sig): restarting sheaf"; sheaf_kill; sleep 1
+		elif [ $age -gt 15 ]; then # writes its status every second: silent for 15 s = hung (killed if TERM is not enough)
+			log "sheaf status not updated for ${age} s: restarting it"; sheaf_kill; sleep 1
+		else
+			return 0
+		fi
+	fi
+	tun_make && tun_up || { log "shf0 not ready: sheaf not started"; return 1; }
+	# ids = the IKE ids of the links in the order of -links: sheaf numbers its links 1, 2, ... in that order, and
+	# its status file says only the number (the recovery ladder maps it back, sheaf_dead)
+	local ids=
+	if [ "$ROLE" != hub ]; then
+		sig=$(link_sig); echo "$sig" > /tmp/sheaf-links.sig
+		case "$sig" in *wwan0:*) spec="@wwan0:7001>$SRV:$PORT1"; ids=$ID1 ;; esac
+		case "$sig" in *wwan1:*) spec="$spec${spec:+,}@wwan1:7002>$SRV:$PORT2"; ids="$ids${ids:+ }$ID2" ;; esac
+		[ -n "$spec" ] || { log "no modem interface: sheaf not started"; return 1; }
+	fi
+	if [ "$ROLE" = hub ]; then
+		spec=; sig=$(hub_links | tr "\n" " "); echo "$sig" > /tmp/sheaf-links.sig
+		for x in $(hub_links); do
+			IFS=: read src lp sp gw id <<L
+$x
+L
+			spec="$spec${spec:+,}$src:$lp>$SRV:$sp"; ids="$ids${ids:+ }$id"
+		done
+		[ -n "$spec" ] || { log "no satellite connected: sheaf not started"; return 1; }
+	fi
+	echo "$ids" > /tmp/sheaf-links.ids
+	local tpa=; [ "$TPROXY" = 1 ] && tpa="-transparent 0.0.0.0:$TPORT"
+	/usr/sbin/sheaf -reliable -key /etc/sheaf/sheaf.key -tun shf0 -frame $FRAME -status /tmp/sheaf-status.json -modefile /etc/sheaf/mode ${TRACE:+-trace $TRACE} $tpa $EXTRA \
+		-links "$spec" \
+		-proxy "192.168.1.1:5201>127.0.0.1:5201;192.168.1.1:5202>127.0.0.1:5202" 2>&1 | logger -t sheaf-core &
+	log "sheaf started (frame $FRAME${tpa:+, transparent TCP proxy :$TPORT})"
+	log "tunnel shf0: default route through the server"
+}
+
+# radio state of each modem, every loop (10 s), into /tmp/radio.csv (RAM); a cell or technology change also to the log.
+# One combined query on the same port the loop dials on - the loop is sequential, so the two never collide.
+# HCSQ (LTE): rssi, rsrp, sinr, rsrq coded (rsrp = x-140 dBm, sinr = x*0.2-20 dB, rsrq = x*0.5-19.5 dB);
+# MONSC: rat, mcc, mnc, earfcn, cell id, pci, tac, rsrp, rsrq, rxlev.
+radio_log() { # tty, interface
+	local t=$1 ifc=$2 h m rat rsrp sinr rsrq cell pci arfcn key old
+	at $t 'AT^HCSQ?;^MONSC'
+	h=$(grep -m1 '^\^HCSQ:' /tmp/sheaf-at.$t | tr -d '"\r' | cut -d' ' -f2)
+	m=$(grep -m1 '^\^MONSC:' /tmp/sheaf-at.$t | tr -d '\r' | cut -d' ' -f2)
+	[ -n "$h$m" ] || return
+	rat=${h%%,*}
+	set -- $(echo "$h" | tr ',' ' ')
+	if [ "$rat" = LTE ] && [ $# -ge 5 ]; then
+		rsrp=$(($3 - 140)); sinr=$(awk "BEGIN{printf \"%.1f\", $4*0.2-20}"); rsrq=$(awk "BEGIN{printf \"%.1f\", $5*0.5-19.5}")
+	fi
+	set -- $(echo "$m" | tr ',' ' ')
+	arfcn=$4; cell=$5; pci=$6
+	[ -f /tmp/radio.csv ] || echo "uptime_s,modem,rat,rsrp_dbm,sinr_db,rsrq_db,cell,pci,earfcn" > /tmp/radio.csv
+	echo "$(cut -d' ' -f1 /proc/uptime),$ifc,$rat,$rsrp,$sinr,$rsrq,$cell,$pci,$arfcn" >> /tmp/radio.csv
+	key="$rat/$cell/$pci/$arfcn"
+	old=$(cat /tmp/radio.last.$ifc 2>/dev/null)
+	[ -n "$old" ] && [ "$old" != "$key" ] && log "$ifc: radio change $old -> $key (rsrp $rsrp sinr $sinr)"
+	echo "$key" > /tmp/radio.last.$ifc
+	# keep the RAM file bounded (~ 1 day at 2 modems / 10 s)
+	[ $(wc -l < /tmp/radio.csv) -gt 20000 ] && { sed -i '2,10001d' /tmp/radio.csv; }
+}
+
+# the same for a QMI modem: signal (rsrp, sinr/snr, rsrq) and the network's view of the cell (serving system)
+qmi_radio_log() { # usb, interface
+	local w s rat rsrp sinr rsrq cell key old
+	w=$(wdm $1); [ -n "$w" ] || return
+	s=$(q $w --get-signal-info | tr -d '\n ')
+	[ -n "$s" ] || return
+	rat=$(echo "$s" | jval type); rsrp=$(echo "$s" | jval rsrp); sinr=$(echo "$s" | jval snr); rsrq=$(echo "$s" | jval rsrq)
+	cell=$(q $w --get-serving-system | tr -d '\n ' | jval plmn_description)
+	[ -f /tmp/radio.csv ] || echo "uptime_s,modem,rat,rsrp_dbm,sinr_db,rsrq_db,cell,pci,earfcn" > /tmp/radio.csv
+	echo "$(cut -d' ' -f1 /proc/uptime),$2,$rat,$rsrp,$sinr,$rsrq,$cell,," >> /tmp/radio.csv
+	key="$rat/$cell"
+	old=$(cat /tmp/radio.last.$2 2>/dev/null)
+	[ -n "$old" ] && [ "$old" != "$key" ] && log "$2: radio change $old -> $key (rsrp $rsrp sinr $sinr)"
+	echo "$key" > /tmp/radio.last.$2
+	[ $(wc -l < /tmp/radio.csv) -gt 20000 ] && { sed -i '2,10001d' /tmp/radio.csv; }
+}
+radio() { case $(mtype $2) in qmi) qmi_radio_log $1 $2 ;; mbim) ;; *) radio_log $(tty $1) $2 ;; esac; } # mbim: no radio values yet
+
+# --- recovery ladder ---------------------------------------------------------------------------------------------
+# A link can stay dead with every check above content: a modem that says "connected" but passes nothing, a server
+# that lost its IKE state without a DELETE, an IKE exchange that failed once and is never retried (a missing PSK,
+# 26 Nov: charon kept its trap policies and waited, nothing reloaded, the tunnel stayed down). Per link (IKE id),
+# once a round: "bad" = its modem has an address, but its IKE SA is not ESTABLISHED (IPSEC=1) or sheaf has it dead.
+# From the first bad round (uptime; /tmp/sheaf-ladder.<id> = "start step next") one step at a time, each logged:
+#   step 1, 30 s:   end its IKE SA (also an ESTABLISHED one that carries nothing: the server lost its side, T5
+#                   26 Nov: 86 s with this only at step 2), reload creds + connections, initiate its CHILD (detached)
+#   step 2, 60 s:   the same once more
+#   step 3, 3 min:  redial the modem (hang up; the dial loop dials it again in the next round)
+#   step 4, 6 min:  reset the modem (Huawei AT^RESET; QMI/MBIM: USB authorized 0/1)
+#   step 5, 15 min: USB authorized 0/1; the ladder ends there, a new one starts if the link is bad again
+# No link good at all = more likely the server, the key or the network than a modem: steps 3-5 then wait for
+# 10 / 20 / 30 min. At least 30 s between two steps of a link, 2 min after a modem step. A good link ends its ladder.
+# Only the bad link's own IKE SA and modem are touched. A link without an address belongs to the dial loop (no
+# ladder starts); one already started goes on with the modem steps, the IKE steps need an address.
+LADDER="30 60 180 360 900"; LADDER_SLOW="30 60 600 1200 1800"
+USBSYS=/sys/bus/usb/devices
+SECDIR=/etc/swanctl/conf.d
+# the IKE ids that sheaf has dead: no feedback over the link for 12 s (the peer sends it on every link at least
+# every 2 s: 6 missed in a row), or marked dead and no feedback for 6 s (dead with feedback coming = slow, not dead). Nothing while its
+# status is unknown: not running, the file stale, or sheaf up less than 30 s.
+sheaf_dead() {
+	local f=/tmp/sheaf-status.json up n dead fb id m
+	[ -f $f ] && pgrep -f "^/usr/sbin/sheaf " >/dev/null || return 0
+	m=$(date -r $f +%s 2>/dev/null) || return 0
+	[ $(( $(date +%s) - m )) -le 30 ] || return 0
+	up=$(sed -n 's/.*"uptime_s":\([0-9]*\).*/\1/p' $f); [ "${up:-0}" -ge 30 ] || return 0
+	tr '{' '\n' < $f | sed -n 's/^"id":\([0-9]*\),"dead":\([a-z]*\),.*"last_fb_ms":\(-\{0,1\}[0-9]*\).*/\1 \2 \3/p' |
+	while read n dead fb; do
+		id=$(awk -v n=$n '{ print $n }' /tmp/sheaf-links.ids 2>/dev/null)
+		[ -n "$id" ] || continue
+		{ [ "$fb" -lt 0 ] || [ "$fb" -gt 12000 ] || { [ "$dead" = true ] && [ "$fb" -gt 6000 ]; }; } && echo $id
+	done
+}
+# the PSK files (names + contents): fixing a missing or wrong key reloads by itself
+secret_sig() { { ls $SECDIR; cat $SECDIR/*.conf; } 2>/dev/null | md5sum | cut -c1-32; }
+ike_initiate() { tmo 30 swanctl --initiate --child sheaf-$1 --timeout 25 >/dev/null 2>&1 & } # id, detached
+ike_kick() { ike_down $1; ipsec_load; ike_initiate $1; } # id
+# modem_act redial|reset|usb ID: one modem step for the modem of this link; 1 = nothing done (no such modem here,
+# not on USB). It only takes the modem's session down: the dial loop above brings it back up as for any lost modem.
+modem_act() {
+	local x usb ifc tbl rest m=
+	for x in $MODEMS; do [ "${x##*:}" = "$2" ] && m=$x; done
+	[ -n "$m" ] || return 1
+	IFS=: read usb ifc tbl rest <<M
+$m
+M
+	case $1 in
+	redial) present $usb $ifc || return 1
+		case $(mtype $ifc) in qmi) qmi_stop $usb $ifc ;; mbim) mbim_stop $usb $ifc ;; *) at $(tty $usb) 'AT^NDISDUP=1,0' ;; esac ;;
+	reset) present $usb $ifc || return 1
+		case $(mtype $ifc) in
+		qmi|mbim) modem_act usb $2; return ;;
+		*) at $(tty $usb) 'AT^RESET' ;;
+		esac ;;
+	usb) [ -e $USBSYS/$usb/authorized ] || return 1
+		echo 0 > $USBSYS/$usb/authorized; sleep 2; echo 1 > $USBSYS/$usb/authorized ;;
+	esac
+	ip addr flush dev $ifc 2>/dev/null
+	rm -f /tmp/sheaf-lease.$ifc /tmp/sheaf-backoff.$ifc
+	[ $1 = redial ] || rm -f /tmp/sheaf-cid.$ifc /tmp/sheaf-mbimtid.$ifc # the modem starts afresh: no session of ours
+	return 0
+}
+# ladder state of a link -> start step next; a missing or garbled file = none (a bad number in $(( )) ends ash)
+lstate() {
+	local a b c; read a b c 2>/dev/null < /tmp/sheaf-ladder.$1 || return 1
+	case "$a:$b:$c" in *[!0-9:]*|:*|*::*|*:) rm -f /tmp/sheaf-ladder.$1; return 1 ;; esac
+	case $b in [0-4]) ;; *) rm -f /tmp/sheaf-ladder.$1; return 1 ;; esac # the step done last: 0 (none) .. 4
+	echo "$a $b $c"
+}
+ladder() {
+	local t dead addrs x id has est why start step next e s g th sas="" good=0 bads=""
+	t=$(now_s)
+	if [ "$IPSEC" = 1 ]; then
+		[ -f /tmp/sheaf-ipsec.loaded ] || return 0 # nothing loaded: the IPsec part of the loop is at it
+		sas=$(tmo 5 swanctl --list-sas --noblock 2>/dev/null) || return 0 # charon busy or hung: charon_up's part
+	fi
+	dead=" $(sheaf_dead | tr '\n' ' ') "
+	addrs=" $(link_list | awk '{ print $4 }' | tr '\n' ' ') "
+	for id in $(ike_ids); do
+		case "$addrs" in *" $id "*) has=1 ;; *) has=0 ;; esac
+		est=1; [ "$IPSEC" = 1 ] && ! echo "$sas" | grep -q "^sheaf-$id: #[0-9]*, ESTABLISHED" && est=0
+		case "$dead" in *" $id "*) why=dead_in_sheaf ;; *) why= ;; esac
+		[ $est = 0 ] && why=no_IKE_SA
+		if [ $has = 1 ] && [ -z "$why" ]; then
+			good=$((good+1))
+			if lstate $id >/dev/null; then
+				read start step next < /tmp/sheaf-ladder.$id
+				[ "$step" -gt 0 ] && log "ladder: $id alive again after $((t - start)) s (step $step)"
+				rm -f /tmp/sheaf-ladder.$id
+			fi
+		elif [ $has = 1 ] || lstate $id >/dev/null; then
+			lstate $id >/dev/null || echo "$t 0 $t" > /tmp/sheaf-ladder.$id
+			[ $has = 0 ] && why=no_address
+			bads="$bads $id:$has:$est:$why"
+		fi
+	done
+	[ $good = 0 ] && th=$LADDER_SLOW || th=$LADDER
+	for x in $bads; do
+		IFS=: read id has est why <<B
+$x
+B
+		why=$(echo $why | tr _ ' ')
+		# the keys were changed: try at once, not only at the next step
+		[ "$KICK" = 1 ] && [ $has = 1 ] && [ $est = 0 ] && { log "ladder: $id: keys changed, initiating"; ike_down $id; ike_initiate $id; }
+		read start step next < /tmp/sheaf-ladder.$id
+		[ "$t" -ge "$next" ] || continue
+		s=$((step + 1)); e=$((t - start)); g=0
+		[ $e -ge $(echo $th | cut -d' ' -f$s) ] || continue
+		case $s in
+		1) [ $has = 1 ] && [ "$IPSEC" = 1 ] && { log "ladder: $id bad for $e s ($why): step 1, restart its IKE SA"; ike_kick $id; g=30; } ;;
+		2) [ $has = 1 ] && [ "$IPSEC" = 1 ] && { log "ladder: $id bad for $e s ($why): step 2, restart its IKE SA again"; ike_kick $id; g=30; } ;;
+		3) modem_act redial $id && { log "ladder: $id bad for $e s ($why): step 3, modem hung up, redialling"; g=120; } ;;
+		4) modem_act reset $id && { log "ladder: $id bad for $e s ($why): step 4, modem reset"; g=120; } ;;
+		5) modem_act usb $id && log "ladder: $id bad for $e s ($why): step 5, USB re-plugged; ladder ends" ;;
+		esac
+		if [ $s = 5 ]; then rm -f /tmp/sheaf-ladder.$id; else echo "$start $s $((t + g))" > /tmp/sheaf-ladder.$id; fi
+	done
+	KICK=0
+}
+
+stop_all() {
+	sheaf_kill
+	ike_down $(ike_ids)
+	killall charon 2>/dev/null; sleep 1
+	ip xfrm state flush; ip xfrm policy flush
+	local m usb ifc tbl rest
+	for m in $MODEMS; do
+		IFS=: read usb ifc tbl rest <<M
+$m
+M
+		ip rule del table $tbl 2>/dev/null; ip route flush table $tbl 2>/dev/null
+		case $(mtype $ifc) in qmi) qmi_stop $usb $ifc ;; mbim) mbim_stop $usb $ifc ;; *) t=$(tty $usb); [ -n "$t" ] && at $t 'AT^NDISDUP=1,0' ;; esac
+		ip link set $ifc down
+	done
+	local k=200 src lp sp gw id
+	for x in $HUB_LINKS; do
+		IFS=: read src lp sp gw id <<L
+$x
+L
+		k=$((k+1)); ip rule del from $src table $k 2>/dev/null; ip addr del $src/24 dev $(hub_dev $gw) 2>/dev/null
+	done
+	nft delete table inet sheaf_ipsec 2>/dev/null
+	tproxy_off
+	rm -f $SWC $SWC.links /tmp/sheaf-guard.ports /tmp/sheaf-lease.* /tmp/sheaf-ipsec.loaded /tmp/sheaf-links.sig /tmp/sheaf-sat.* \
+		/tmp/sheaf-hub.active /tmp/sheaf-backoff.* /tmp/sheaf-ladder.* /tmp/sheaf-links.ids
+	# shf0, its routes and the LAN guard stay: the LAN stays shut off from the modems, its connections survive a restart
+	log "stopped, modems down"
+}
+
+# manual stop outside procd: TERM the supervisor, it cleans up (see the trap below)
+[ "$1" = stop ] && { for p in $(pgrep -f "^/bin/sh /usr/sbin/sheaf-run$"); do kill $p; done; exit 0; }
+
+trap 'log "stopping"; stop_all; exit 0' TERM INT
+log "starting ($ROLE $BOX, server $SRV ports $PORT1/$PORT2${HUB_LINKS:+ links $HUB_LINKS}, tunnel $TUN, ipsec $IPSEC)"
+rm -f /tmp/sheaf-redials.* /tmp/sheaf-backoff.* /tmp/sheaf-ladder.* # counted per run of the service: the first dial of each modem is not a redial
+n=0; SECSIG=; KICK=0
+while true; do
+	n=$((n+1))
+	for m in $MODEMS; do
+		IFS=: read usb ifc tbl lp sp id <<M
+$m
+M
+		ok=1
+		read ip gw 2>/dev/null < /tmp/sheaf-lease.$ifc || ok=0 # 2> first: it must already apply when the < fails
+		[ $ok = 1 ] && ! ip -4 addr show dev $ifc 2>/dev/null | grep -q "inet $ip/" && ok=0
+		[ $ok = 1 ] && [ $((n % 6)) = 0 ] && present $usb $ifc && mundialed $usb $ifc && ok=0 # the modem's own view, once a minute
+		if [ $ok = 0 ] && { ! present $usb $ifc || dial_due $ifc; }; then
+			log "$ifc: not ready, (re)dialling"
+			if modem_up $usb $ifc $tbl; then rm -f /tmp/sheaf-backoff.$ifc
+			elif present $usb $ifc; then dial_failed $ifc
+			else rm -f /tmp/sheaf-backoff.$ifc; fi # gone from USB: dialled at once when it is back
+			echo $(( $(cat /tmp/sheaf-redials.$ifc 2>/dev/null || echo -1) + 1 )) > /tmp/sheaf-redials.$ifc # the first dial is not a redial
+		fi
+		present $usb $ifc && radio $usb $ifc
+	done
+	[ "$ROLE" = hub ] && { hub_scan; hub_up; }
+	[ "$ROLE" = satellite ] && { ft_off; tun_remove; sat_up; sleep 10 & wait $!; continue; } # no IPsec, no sheaf
+	tun_make && tun_up; lan_guard # also while sheaf is down: the LAN goes into shf0 (dropped there), never to the modems
+	if [ "$IPSEC" = 1 ]; then
+		ipsec_guard
+		charon_up
+		# the PSK files changed (a key put back or replaced): reload now and initiate the links without an IKE SA -
+		# charon does not retry an exchange that failed for a missing key, and our config file did not change
+		s=$(secret_sig)
+		if [ -n "$SECSIG" ] && [ "$s" != "$SECSIG" ]; then
+			log "ipsec: the keys in $SECDIR changed: reloading"; rm -f /tmp/sheaf-ipsec.loaded; KICK=1
+		fi
+		SECSIG=$s
+		if ipsec_conf; then # an address changed: drop the IKE SAs of the old addresses, the trap policies renegotiate
+			ike_down $IKE_GONE
+			ipsec_load
+		elif [ ! -f /tmp/sheaf-ipsec.loaded ]; then
+			ipsec_load
+		else
+			ipsec_policies # loaded and unchanged: are the policies still in the kernel? If not, a new charon now
+			[ -f /tmp/sheaf-ipsec.loaded ] || { charon_up; ipsec_conf; ipsec_load; }
+		fi
+	fi
+	if [ "$IPSEC" = 1 ] && [ ! -f /tmp/sheaf-ipsec.loaded ]; then # no new sheaf without IPsec
+		# a running one stays while the guard is in place (its UDP cannot leave in plaintext): one failed load (a swanctl
+		# timeout) must not restart sheaf; the load is retried next round. Without the guard: stop it (fail closed).
+		if ! nft list table inet sheaf_ipsec >/dev/null 2>&1; then
+			pgrep -f "^/usr/sbin/sheaf " >/dev/null && { log "ipsec not loaded, no guard: sheaf stopped until it is"; sheaf_kill; }
+		fi
+	else
+		sheaf_up
+	fi
+	tproxy_sync # the redirect follows sheaf's listener (TPROXY=1)
+	ft_sync # LAN <-> shf0 flowtable shortcut (FLOWTABLE=1)
+	ladder # links dead with an address: IKE, then the modem (above)
+	sleep 10 & wait $! # wait is interruptible: TERM ends the loop at once
+done

@@ -1,0 +1,7 @@
+{
+	"luci-app-sheaf": {
+		"description": "Sheaf: bonding mode",
+		"read": { "file": { "/etc/sheaf/mode": [ "read" ], "/tmp/sheaf-status.json": [ "read" ], "/tmp/sheaf-links.ids": [ "read" ] } },
+		"write": { "file": { "/etc/sheaf/mode": [ "write" ] } }
+	}
+}

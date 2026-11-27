@@ -1,0 +1,37 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Petr Wozniak
+# First boot of the sheaf firmware (uci-defaults, runs once): LAN reaches the internet through the tunnel (zone
+# "sheaf" on shf0 with masquerade + MSS clamp, public resolvers through the tunnel), secrets survive sysupgrade,
+# the service starts at boot. Secrets are NOT in the image: /etc/sheaf/sheaf.key, /etc/swanctl/conf.d/sheaf-secret.conf,
+# the root password and SSH key are put on the box once (see docs/USAGE.md).
+uci -q delete firewall.sheaf
+uci set firewall.sheaf=zone
+uci set firewall.sheaf.name='sheaf'
+uci add_list firewall.sheaf.device='shf0'
+uci set firewall.sheaf.input='REJECT'
+uci set firewall.sheaf.output='ACCEPT'
+uci set firewall.sheaf.forward='REJECT'
+uci set firewall.sheaf.masq='1'
+uci set firewall.sheaf.mtu_fix='1'
+uci -q delete firewall.lan_sheaf
+uci set firewall.lan_sheaf=forwarding
+uci set firewall.lan_sheaf.src='lan'
+uci set firewall.lan_sheaf.dest='sheaf'
+uci commit firewall
+uci -q delete dhcp.@dnsmasq[0].server
+uci add_list dhcp.@dnsmasq[0].server='1.1.1.1'
+uci add_list dhcp.@dnsmasq[0].server='9.9.9.9'
+uci set dhcp.@dnsmasq[0].noresolv='1'
+uci commit dhcp
+# logs of a night survive: the default 64 kB ring held ~10 min of sheaf's lines
+[ "$(uci -q get system.@system[0].log_size)" -ge 512 ] 2>/dev/null || { uci set system.@system[0].log_size='512'; uci commit system; }
+for f in /etc/sheaf/ /etc/swanctl/conf.d/; do # /etc/sheaf/ holds the key too
+	grep -qxF "$f" /etc/sysupgrade.conf || echo "$f" >> /etc/sysupgrade.conf
+done
+/etc/init.d/sheaf enable
+# installed with apk on a running box (not at first boot): the new zone and resolvers must take effect now, else the LAN
+# has no masquerade into shf0 and the box itself no DNS
+nft list tables 2>/dev/null | grep -q fw4 && fw4 reload >/dev/null 2>&1
+pidof dnsmasq >/dev/null && /etc/init.d/dnsmasq restart >/dev/null 2>&1
+exit 0

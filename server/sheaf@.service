@@ -1,0 +1,26 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Petr Wozniak
+[Unit]
+Description=sheaf bonding server for box %i
+After=network-online.target
+Wants=network-online.target
+
+# One instance per additional box: /opt/sheaf/%i.env sets
+#   LINKS          the box's links, e.g. 0.0.0.0:47011>-,0.0.0.0:47012>- (box n: 470(n-1)1, 470(n-1)2, ...; a hub with
+#                  four links through satellites: four ports)
+#   TUN, ADDR      tunnel interface and the server's address on it (box n: shf<n-1>, 10.66.0.<4n-3>/30)
+#   KEY            the box's sheaf key file (/etc/sheaf/<box>.key, mode 600)
+# Box 1 keeps sheaf.service (47001/47002, shf0, 10.66.0.1/30, /etc/sheaf/box1.key).
+# The server firewall lets in UDP 47001:47099 and forwards/NATs shf+ / 10.66.0.0/24 - nothing to change per box.
+[Service]
+Environment=TRACE=
+Environment=FRAME=1400
+Environment=EXTRA=
+EnvironmentFile=/opt/sheaf/%i.env
+ExecStart=/opt/sheaf/sheaf -reliable -serve -allow 127.0.0.1:5201,127.0.0.1:5202 -key ${KEY} -tun ${TUN} -links ${LINKS} -status /run/sheaf-%i.json -mode peer -pace 1.25 -trace=${TRACE} -frame=${FRAME} $EXTRA
+ExecStartPost=/bin/sh -c 'for i in 1 2 3 4 5 6 7 8 9 10; do ip link show ${TUN} >/dev/null 2>&1 && break; sleep 0.5; done; ip addr replace ${ADDR} dev ${TUN}; ip link set ${TUN} mtu 1320 up'
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
